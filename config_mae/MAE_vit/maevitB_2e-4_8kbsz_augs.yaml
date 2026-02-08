@@ -1,0 +1,61 @@
+# Classification config for LatentResNet
+
+wandb:
+  project: "vae-test"
+  entity: "mingyangd"
+  name: null
+
+# Dataset configuration
+dataset:
+  # Supported: mnist, cifar10, imagenet32, imagenet64, imagenet128, imagenet256
+  name: "imagenet256_latent"
+  img_shape: [4, 32, 32]
+
+# Model configuration for LatentResNet
+# Only simple fields are needed; `arch` is mapped to (block, layers) in code
+model:
+  num_classes: 1000
+  in_channels: 4
+  img_size: 32
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  mlp_ratio: 4.0
+  n_cls_tokens: 32
+  num_classes: 1000
+  patch_size: 2
+
+# Training parameters
+train:
+  n_steps: 200000
+  total_batch_size: 8192
+  ema_dict:
+    halflife_kimg: 4000
+  save_per_step: 5000
+  eval_per_step: 1000
+  compile_model: false
+  use_bf16: false
+  eval_gen_batch_size: 256
+  lr_schedule:
+    lr: 0.0002
+    warmup_kimg: 10000
+    total_kimg: 100000000
+    clip_grad: 1.0
+  load_dict:
+    run_id: ""
+    epoch: ""
+    continue_training: false
+  lambda_cls: 0.1
+  mask_ratio_min: 0.5
+  mask_ratio_max: 0.5
+
+
+# Optimizer settings
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+
+model_type: "mae_vit"
