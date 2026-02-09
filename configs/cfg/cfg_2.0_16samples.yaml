@@ -1,0 +1,86 @@
+# Configs for VAE training
+# should get 17 ish 5k FID on 100k steps. 
+# Path settings
+data_dir: "/private/home/mingyangd/imagenet"
+checkpoints_dir: "/private/home/mingyangd/dmy/nn_flow/checkpoints"
+output_dir: "/private/home/mingyangd/dmy/output_nn_flow"
+fid_stats:
+  imagenet32: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in32_stats.npz"
+  imagenet256: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in256_stats.npz"
+
+# W&B settings for logging
+wandb:
+  project: "vae-test"
+  entity: "mit-hair"
+  name: null
+
+# Distributed training settings
+# dist_url: "env://" # this doesn't work for slurm
+
+# Dataset configuration
+dataset:
+  name: "imagenet32"
+  test_batch_size: 128
+  img_shape: [3, 32, 32]
+
+# Model architecture
+model:
+  input_shape: [3, 32, 32]
+  latent_shape: [8, 8]
+  cond_dim: 512
+  patch_size: 1
+  pad_tokens: 16
+  transformer_config:
+    depth: 8
+    hidden_size: 768
+    num_heads: 12
+    mlp_ratio: 4.0
+    qk_norm: true
+    attn_drop: 0.1
+    proj_drop: 0.1
+  decoder_config:
+    has_l2_head: false
+    head_mult: 64
+    head_blocks: 6
+  share_lat: true
+  loss_on_patches: []
+  use_style: true
+
+# Training parameters
+train:
+  n_steps: 100000
+  total_batch_size: 1024
+  ema_dict:
+    halflife_kimg: 2000
+  recon_per_step: 1000
+  save_per_step: 10000
+  eval_gen_per_step: 1000
+  eval_recon_per_step: 1000
+  compile_model: false
+  use_bf16: false
+  lr_schedule:
+    lr: 0.0004
+    warmup_kimg: 4000
+    total_kimg: 2000000
+    clip_grad: 10.0
+  augmentation_kwargs:
+    enable: true
+    augmentation_dim: 9
+    kwargs: {}
+  drop_class: 0.1
+  load_dict:
+    run_id: ""
+    epoch: ""
+    continue_training: false
+  forward_dict:
+    target_kl: [0.0]
+    kl_w: 0.1
+    recon: 8
+  memory_bank_size: 16
+  cfg_scale: 2.0
+  n_neg_samples: 16
+
+# Optimizer settings
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.01 

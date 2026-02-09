@@ -1,0 +1,42 @@
+# Configuration for biased_mixtures toy dataset (imbalanced mixture components)
+gen:
+  type: "mlp"
+  kwargs:
+    noise_dim: 64
+    output_dim: 2
+    acti: "relu"
+
+dataset: 
+  name: "biased_mixtures"
+  weights: [0.5, 0.25, 0.25]
+  std: 0.3
+
+train:
+  n_steps: 10000
+  data_bsz: 256
+  gen_per_data: 8
+  pos_per_data: 32
+  lr_schedule:
+    lr: 0.003
+    clip_grad: 1.0
+  loss_config:
+    R_list: [0.2]
+    sample_norm: True
+    scale_dist: False
+    no_R_norm: True
+    no_global_norm: False
+    new_R_norm: False
+    scale_dist_normed: True
+    coord_norm: False
+  neg_cfg:
+    dataset:
+      name: "biased_mixtures"
+      weights: [1.0, 0.0, 0.0]
+      std: 0.3
+    n_neg_samples: 16
+    cfg_scale: 1.5
+
+wandb:
+  name: "edm_toy_sanity"
+  project: "toy_kernel"
+  entity: "mit-hair"

@@ -1,0 +1,125 @@
+# Configs for Dit-based VAE training
+# Path settings
+data_dir: "/private/home/mingyangd/imagenet"
+checkpoints_dir: "/private/home/mingyangd/dmy/nn_flow/checkpoints"
+output_dir: "/private/home/mingyangd/dmy/output_nn_flow"
+fid_stats:
+  imagenet32: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in32_stats.npz"
+  imagenet256: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in256_stats.npz"
+
+# W&B settings for logging
+wandb:
+  project: "vae-test"
+  entity: "mit-hair"
+  name: null
+
+# Distributed training settings
+# dist_url: "env://" # this doesn't work for slurm
+
+# Dataset configuration
+dataset:
+  name: "imagenet256_cache"
+  test_batch_size: 128
+  img_shape: [4, 32, 32]
+
+# Model architecture
+model:
+  input_shape: [4, 32, 32]
+  decoder_config:
+    input_size: 32
+    patch_size: 2
+    in_channels: 4
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    out_channels: 4
+    cond_dim: 768
+    use_qknorm: true
+    attn_drop: 0.0
+    proj_drop: 0.0
+    use_checkpoint: false
+    use_rope: false
+    use_swiglu: true
+    use_rmsnorm: true
+    wo_shift: false
+    num_classes: 1000
+    noise_classes: 64
+    noise_coords: 16
+  loss_on_patches: []
+  clip_dict:
+    model_type: "mae_resnet"
+    load_dict:
+      run_id: "resnet34_L_4e-3_20251002_041210"
+      epoch: "190000"
+      load_entry: "ema_model"
+    num_classes: 1000
+    in_channels: 4
+    base_channels: 160
+    layers: [3, 8, 12, 5]
+    dropout_prob: 0.0
+    patch_size: 2
+    extract_kwargs:
+      patch_group_size: 2
+      patch_mean_size: [2,4]
+      transpose_goal_dims: []
+      min_res: 32
+      use_mean: true
+      use_std: true
+      use_layers: [2,3,4]
+
+      
+
+  enable_clip: true
+  feature_params:
+    laplacian_load_dict:
+      enable: false
+
+# Training parameters
+train:
+  n_steps: 100000
+  total_batch_size: 512
+  recon_per_step: 1000
+  save_per_step: 10000
+  eval_gen_per_step: 1000
+  eval_recon_per_step: 1000
+  compile_model: false
+  use_bf16: false
+  eval_bsz_per_gpu: 16
+  lr_schedule:
+    lr: 0.0008
+    warmup_kimg: 10000
+    total_kimg: 2000000
+    clip_grad: 1.0
+  augmentation_kwargs:
+    enable: true
+    augmentation_dim: 9
+    kwargs: {}
+  drop_class: 0.1
+  load_dict:
+    run_id: ""
+    epoch: ""
+    continue_training: false
+  forward_dict:
+    recon: 16
+    attn_dict:
+      kernel_type: "attn_new"
+      R_list: [0.2]
+      transpose_aff: true
+
+  cond_mem_bank_size: 128   # capacity for conditional memory bank
+  uncond_mem_bank_size: 1000 # capacity for unconditional memory bank
+  gen_mem_bank_size: 0    # capacity for generator memory bank
+  n_cond_samples: 32         # per-datapoint draws from conditional bank
+  n_uncond_samples: 16        # per-datapoint draws from uncond bank
+  n_gen_bank_samples: 0     # per-datapoint draws from gen bank (negatives
+  cfg_scale: 2.0
+  n_classes: 1000
+  n_push_per_step: 128
+
+# Optimizer settings
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.01 
+  beta1: 0.9
+  beta2: 0.95

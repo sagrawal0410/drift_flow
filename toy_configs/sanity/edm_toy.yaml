@@ -1,0 +1,26 @@
+# Configuration for biased_mixtures toy dataset (imbalanced mixture components)
+gen:
+  type: "mlp"
+  kwargs:
+    noise_dim: 64
+    output_dim: 2
+    acti: "relu"
+
+dataset: "edm_toy"
+
+train:
+  n_steps: 10000
+  data_bsz: 2
+  sample_per_data: 256
+  pos_per_data: 128
+  lr_schedule:
+    lr: 0.003
+    clip_grad: 1.0
+  loss_config:
+    type: "attn"
+    R: [0.2]
+
+wandb:
+  name: "edm_toy_sanity"
+  project: "toy_kernel"
+  entity: "mit-hair"

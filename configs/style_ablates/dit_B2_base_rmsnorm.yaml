@@ -1,0 +1,104 @@
+# Configs for Dit-based VAE training
+# Path settings
+data_dir: "/private/home/mingyangd/imagenet"
+checkpoints_dir: "/private/home/mingyangd/dmy/nn_flow/checkpoints"
+output_dir: "/private/home/mingyangd/dmy/output_nn_flow"
+fid_stats:
+  imagenet32: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in32_stats.npz"
+  imagenet256: "/private/home/mingyangd/dmy/nn_flow/utils/fid_stats/adm_in256_stats.npz"
+
+# W&B settings for logging
+wandb:
+  project: "vae-test"
+  entity: "mit-hair"
+  name: null
+
+# Distributed training settings
+# dist_url: "env://" # this doesn't work for slurm
+
+# Dataset configuration
+dataset:
+  name: "imagenet32"
+  test_batch_size: 128
+  img_shape: [3, 32, 32]
+
+# Model architecture
+model:
+  input_shape: [3, 32, 32]
+  decoder_config:
+    input_size: 32
+    patch_size: 2
+    in_channels: 3
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    out_channels: 3
+    cond_dim: 768
+    use_qknorm: true
+    attn_drop: 0.0
+    proj_drop: 0.0
+    use_checkpoint: false
+    use_rope: false
+    use_swiglu: false
+    use_rmsnorm: true
+    wo_shift: false
+    num_classes: 1001
+    noise_classes: 1024
+  loss_on_patches: []
+  clip_dict:
+    n_acti: 21
+    min_res: 64
+    use_mean: true
+    use_std: true
+    random_init: false
+    start_acti: 0
+  enable_clip: true
+  feature_params:
+    laplacian_load_dict:
+      enable: false
+
+# Training parameters
+train:
+  n_steps: 100000
+  total_batch_size: 1024
+  ema_dict:
+    halflife_kimg: 2000
+  recon_per_step: 1000
+  save_per_step: 20000
+  eval_gen_per_step: 1000
+  eval_recon_per_step: 1000
+  compile_model: false
+  use_bf16: false
+  lr_schedule:
+    lr: 0.0004
+    warmup_kimg: 10000
+    total_kimg: 2000000
+    clip_grad: 1.0
+  augmentation_kwargs:
+    enable: true
+    augmentation_dim: 9
+    kwargs: {}
+  drop_class: 0.1
+  load_dict:
+    run_id: ""
+    epoch: ""
+    continue_training: false
+  forward_dict:
+    recon: 8
+    attn_dict:
+      kernel_type: "attn"
+      sample_norm: true
+      scale_dist: false
+      scale_dist_normed: true
+      no_R_norm: false
+      no_global_norm: false
+      R_list: [0.2]
+  memory_bank_size: 32
+  cfg_scale: 1.5
+  n_neg_samples: 8
+
+# Optimizer settings
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.01 
