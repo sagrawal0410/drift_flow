@@ -32,10 +32,10 @@ train:
   neg_cfg:
     dataset:
       name: "biased_mixtures"
-      weights: [0.0, 0.0, 1.0]
+      weights: [0.5, 0.0, 0.5]
       std: 0.3
     n_neg_samples: 32
-    cfg_scale: 1.5
+    cfg_scale: 2.7
 
 wandb:
   name: "edm_toy_sanity"
