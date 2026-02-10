@@ -1,0 +1,117 @@
+# Config for DiT-B/2 Drifting Model with MoCo v2 pixel-space features
+# Used by train_drift_clip.py
+
+# ── Path settings ──
+data_dir: "/path/to/imagenet"
+checkpoints_dir: "/path/to/checkpoints"
+output_dir: "/path/to/output"
+fid_stats:
+  imagenet256: "/path/to/fid_stats/adm_in256_stats.npz"
+
+# ── W&B settings ──
+wandb:
+  project: "drift-flow"
+  entity: ""
+  name: null
+
+# ── Dataset ──
+dataset:
+  name: "imagenet256_cache"
+  test_batch_size: 128
+  img_shape: [4, 32, 32]
+
+# ── Generator architecture (DiT-B/2) ──
+model:
+  input_shape: [4, 32, 32]
+  decoder_config:
+    input_size: 32
+    patch_size: 2
+    in_channels: 4
+    out_channels: 4
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    cond_dim: 768
+    use_qknorm: true
+    use_swiglu: true
+    use_rmsnorm: true
+    use_rope: true
+    wo_shift: true
+    attn_drop: 0.0
+    proj_drop: 0.0
+    use_checkpoint: false
+    num_classes: 1000
+    noise_classes: 64        # style embedding codebook size
+    noise_coords: 32         # style embedding tokens
+    n_cls_tokens: 16         # register / in-context tokens
+
+  # MoCo v2 pixel-space feature extractor
+  # Pipeline: latents → SD-VAE decode → 256x256 pixels → MoCo v2 → 2048-d features
+  moco_v2:
+    # Path to official MoCo v2 checkpoint (.pth.tar)
+    # Download from: https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar
+    # If empty, falls back to ImageNet-supervised ResNet-50
+    checkpoint_path: ""
+
+  # No latent-space feature extractors in this config
+  # (MoCo v2 replaces Flatten / Coordinate / UnfoldFeatures)
+  feature_params:
+    has_global: false
+    has_local: false
+
+# ── Training parameters ──
+train:
+  n_steps: 30000               # 30k training steps
+  total_batch_size: 64         # Nc * N_neg = 8 * 8
+  compile_model: false
+  use_bf16: false
+  eval_bsz_per_gpu: 64
+  save_per_step: 5000             # checkpoint every 5k steps
+  eval_gen_per_step: 5000         # FID evaluation every 5k steps
+  eval_fid_samples: 50000         # 50k generated samples for FID
+  lr_schedule:
+    lr: 0.0002                 # 2e-4
+    warmup_steps: 5000         # 5k warmup steps (linear ramp)
+    clip_grad: 2.0
+  ema_decay: 0.999             # EMA decay (evaluation model only, not used as bootstrap target)
+  drop_class: 0.1
+  load_dict:
+    run_id: ""
+    epoch: ""
+    continue_training: false
+
+  # Drifting loss forward config
+  forward_dict:
+    recon: 8                   # N_neg: generated samples per class
+    attn_dict:
+      kernel_type: "attn_new"
+      sample_norm: true
+      scale_dist_normed: true
+      R_list: [0.02, 0.05, 0.2]
+
+  # Sample queue / memory bank (all 0 = just use data batch directly)
+  n_cond_samples: 0
+  n_gen_bank_samples: 0
+  n_uncond_samples: 0
+  cond_mem_bank_size: 0
+  uncond_mem_bank_size: 0
+  gen_mem_bank_size: 0
+
+  # CFG: alpha=1.0 means no guidance
+  min_cfg_scale: 1.0
+  max_cfg_scale: 1.0
+  eval_base_cfg: 1.0
+  eval_cfg_list: [1.0]
+
+  # Class conditioning
+  n_classes: 1000
+  n_class_labels: 8            # Nc: classes sampled per step
+
+# ── Optimizer (AdamW) ──
+optimizer:
+  type: "AdamW"
+  lr: 0.0002                   # 2e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
