@@ -29,6 +29,16 @@ echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
 NGPUS=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
 echo "Using $NGPUS GPUs"
 
+# ── Pre-download SD-VAE (single process, avoids HF cache race condition) ──
+# The VAE decoder is needed every step (latents → pixels → MoCo v2 features)
+# and also for FID evaluation. MoCo v2 loads from local checkpoint, no download needed.
+echo "Pre-downloading SD-VAE..."
+python -c "
+from diffusers import AutoencoderKL
+AutoencoderKL.from_pretrained('stabilityai/sd-vae-ft-ema')
+print('SD-VAE cached.')
+"
+
 # ── Train ──
 torchrun --nproc_per_node=$NGPUS train_drift_clip.py \
     --config configs/dit_B2_clip.yaml \
