@@ -5,7 +5,7 @@
 #SBATCH --qos=vision-he-low
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
