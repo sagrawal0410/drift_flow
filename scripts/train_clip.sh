@@ -20,6 +20,9 @@ mkdir -p logs
 source /data/scratch-oc40/shaurya10/miniconda3/etc/profile.d/conda.sh
 conda activate drift_flow
 
+# ── Wandb API key (compute nodes may not have login credentials) ──
+export WANDB_API_KEY="wandb_v1_X76mfMNkN3pcus42Lt1vTCKpKua"
+
 # ── Distributed rendezvous ──
 export MASTER_ADDR=$(hostname)
 export MASTER_PORT=$(( 29500 + RANDOM % 1000 ))
