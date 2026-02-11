@@ -25,10 +25,6 @@ export MASTER_ADDR=$(hostname)
 export MASTER_PORT=$(( 29500 + RANDOM % 1000 ))
 echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
 
-# Auto-detect GPU count
-NGPUS=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
-echo "Using $NGPUS GPUs"
-
 # ── Pre-download SD-VAE (single process, avoids HF cache race condition) ──
 # The VAE decoder is needed every step (latents → pixels → MoCo v2 features)
 # and also for FID evaluation. MoCo v2 loads from local checkpoint, no download needed.
@@ -40,6 +36,6 @@ print('SD-VAE cached.')
 "
 
 # ── Train ──
-torchrun --nproc_per_node=$NGPUS train_drift_clip.py \
+torchrun --nproc_per_node=8 train_drift_clip.py \
     --config configs/dit_B2_clip.yaml \
     --cached_path /data/scratch-oc40/shaurya10/cache_latents/train
