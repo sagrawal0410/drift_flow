@@ -52,7 +52,7 @@ model:
     # Path to official MoCo v2 checkpoint (.pth.tar)
     # Download from: https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar
     # If empty, falls back to ImageNet-supervised ResNet-50
-    checkpoint_path: ""
+    checkpoint_path: "/data/scratch-oc40/shaurya10/cache_latents/moco_v2_800ep_pretrain.pth.tar"
 
   # No latent-space feature extractors in this config
   # (MoCo v2 replaces Flatten / Coordinate / UnfoldFeatures)
