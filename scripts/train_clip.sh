@@ -21,7 +21,7 @@ source /data/scratch-oc40/shaurya10/miniconda3/etc/profile.d/conda.sh
 conda activate drift_flow
 
 # ── Wandb API key (compute nodes may not have login credentials) ──
-export WANDB_API_KEY="wandb_v1_X76mfMNkN3pcus42Lt1vTCKpKua"
+export WANDB_API_KEY="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"
 
 # ── Distributed rendezvous ──
 export MASTER_ADDR=$(hostname)
