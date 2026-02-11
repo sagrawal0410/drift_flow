@@ -139,19 +139,10 @@ def main(args):
         world_size = 1
         is_main = True
 
-    # ── Run ID and logging ──
+    # ── Run ID ──
     dataset_name = cfg.dataset.get("name", "imagenet256_cache")
     run_name = args.run_name or cfg.wandb.get("name", None) or "dit_B2_flatten"
     run_id = get_run_name(run_name)
-
-    # Wandb — pass entire config for full hyperparameter tracking
-    logger = WandbLogger()
-    logger.setup_wandb(
-        project=cfg.wandb.get("project", "drift-flow"),
-        entity=cfg.wandb.get("entity", None) or None,
-        name=run_id,
-        config=cfg,  # log the full YAML config to wandb
-    )
     if is_main:
         print(f"Run ID: {run_id}")
 
@@ -182,15 +173,32 @@ def main(args):
 
     # ── Generator (from config model.decoder_config) ──
     # DitGen accepts **kwargs and forwards to LightningDiT
-    dec_cfg = cfg.model.decoder_config
+    # Deep copy decoder config to avoid any mutation issues
+    import copy
+    dec_cfg = copy.deepcopy(dict(cfg.model.decoder_config))
     generator = DitGen(**dec_cfg).to(device)
 
+    # Debug: verify param count consistency across ranks before DDP
+    n_param_tensors = sum(1 for _ in generator.parameters())
+    print(f"[Rank {rank}] generator has {n_param_tensors} parameter tensors")
+
     if world_size > 1:
+        dist.barrier()  # ensure all ranks constructed the model
         generator = DDP(generator, device_ids=[local_rank])
 
     if is_main:
         n_params = sum(p.numel() for p in generator.parameters()) / 1e6
         print(f"Generator parameters: {n_params:.1f}M")
+
+    # ── Wandb (initialized AFTER model + DDP to avoid config mutation) ──
+    logger = WandbLogger()
+    wandb_cfg = copy.deepcopy(dict(cfg))  # deep copy so wandb can't modify original
+    logger.setup_wandb(
+        project=cfg.wandb.get("project", "drift-flow"),
+        entity=cfg.wandb.get("entity", None) or None,
+        name=run_id,
+        config=wandb_cfg,
+    )
 
     # ── EMA model (for evaluation / FID only) ──
     ema_decay = cfg.train.get("ema_decay", 0.999)
