@@ -30,6 +30,6 @@ torchrun --nproc_per_node=4 dataset/cache_latent.py \
 # Cache val split
 torchrun --nproc_per_node=4 dataset/cache_latent.py \
     --data_path /data/infolab/aia/imagenet_pytorch/val \
-    --cached_path /data/scratch-oc40/shaurya10/cache_latents/train \
-    --split train \
+    --cached_path /data/scratch-oc40/shaurya10/cache_latents/val \
+    --split val \
     --batch_size 128
