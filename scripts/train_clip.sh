@@ -1,0 +1,35 @@
+#!/bin/bash
+#SBATCH --job-name=train_clip
+#SBATCH --partition=vision-he-h200
+#SBATCH --account=vision-he
+#SBATCH --qos=vision-he-low
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=80
+#SBATCH --mem=256G
+#SBATCH --time=12:00:00
+#SBATCH --output=logs/train_clip_%j.out
+#SBATCH --error=logs/train_clip_%j.err
+
+set -e
+
+mkdir -p logs
+
+# ── Conda activation ──
+source /data/scratch-oc40/shaurya10/miniconda3/etc/profile.d/conda.sh
+conda activate drift_flow
+
+# ── Distributed rendezvous ──
+export MASTER_ADDR=$(hostname)
+export MASTER_PORT=$(( 29500 + RANDOM % 1000 ))
+echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
+
+# Auto-detect GPU count
+NGPUS=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
+echo "Using $NGPUS GPUs"
+
+# ── Train ──
+torchrun --nproc_per_node=$NGPUS train_drift_clip.py \
+    --config configs/dit_B2_clip.yaml \
+    --cached_path /data/scratch-oc40/shaurya10/cache_latents/train
