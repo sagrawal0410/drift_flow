@@ -67,7 +67,7 @@ train:
   compile_model: true          # set true to torch.compile generator + VAE + MoCo
   compile_mode: "default"       # "default", "reduce-overhead", or "max-autotune"
   use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
-  grad_accum_steps: 2            # accumulate over 8 class micro-batches (Nc/8 classes each)
+  grad_accum_steps: 4            # accumulate over 8 class micro-batches (Nc/8 classes each)
   feat_micro_batch: 64           # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
@@ -94,8 +94,8 @@ train:
       R_list: [0.02, 0.05, 0.2]
 
   # Positive sample memory bank
-  n_pos: 16                 # N_pos: positive samples per class (drawn from memory bank)
-  pos_bank_size: 128        # per-class FIFO capacity (stores recent latents across steps)
+  n_pos: 64                 # N_pos: positive samples per class (drawn from memory bank)
+  pos_bank_size: 512        # per-class FIFO capacity (stores recent latents across steps)
 
   # Sample queue / memory bank (legacy — unused when n_pos > 0)
   n_cond_samples: 0
