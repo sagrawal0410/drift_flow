@@ -3,7 +3,7 @@
 #SBATCH --partition=vision-he-h200
 #SBATCH --account=vision-he
 #SBATCH --qos=vision-he-low
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=80
