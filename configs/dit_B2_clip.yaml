@@ -73,7 +73,7 @@ train:
   eval_gen_per_step: 5000         # FID evaluation every 5k steps
   eval_fid_samples: 50000         # 50k generated samples for FID
   lr_schedule:
-    lr: 0.0002                 # 2e-4
+    lr: 0.0015                 # 2e-4
     warmup_steps: 5000         # 5k warmup steps (linear ramp)
     clip_grad: 2.0
   ema_decay: 0.999             # EMA decay (evaluation model only, not used as bootstrap target)
