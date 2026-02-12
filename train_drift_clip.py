@@ -412,7 +412,7 @@ def main(args):
     if is_main:
         moco_params = sum(p.numel() for p in moco_backbone.parameters()) / 1e6
         compiled_tag = " [compiled]" if compile_model else ""
-        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen){compiled_tag}")
+        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen)")
 
     # ── Feature extractor: MoCo v2 pixel-space features ──
     # Pipeline: latents → VAE decode → pixel images → MoCo v2 → 2048-d features
