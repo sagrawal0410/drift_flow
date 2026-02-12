@@ -401,7 +401,7 @@ def main(args):
     # Loaded eagerly because the MoCo v2 feature pipeline needs it every step
     train_vae = build_vae_decoder(device, for_training=True)
     if is_main:
-        print(f"Loaded SD-VAE decoder for MoCo v2 feature pipeline (frozen, grad-through){compiled_tag}")
+        print(f"Loaded SD-VAE decoder for MoCo v2 feature pipeline (frozen, grad-through)")
 
     # ── MoCo v2 backbone (frozen, but gradients flow through for gen path) ──
     moco_cfg = cfg.model.get("moco_v2", {})
