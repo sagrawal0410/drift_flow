@@ -169,7 +169,66 @@ class MoCoV2PixelFeatures(FeatureExtractor):
         return "moco_v2"
 
 
-# (No memory bank — positives come directly from the data batch)
+# ─────────────────────────────────────────────────────────
+# Per-class FIFO memory bank for multiple positive samples
+# ─────────────────────────────────────────────────────────
+
+class ClassMemoryBank:
+    """Per-class FIFO memory bank for positive latent samples.
+
+    A single dataloader batch (e.g. 512 samples across 1000 classes)
+    rarely contains N_pos samples for any given class.  This bank
+    accumulates latents across training steps so that we can draw
+    N_pos diverse positives per class at every step.
+
+    Storage is pre-allocated on GPU as a single contiguous tensor
+    [num_classes, bank_size, *latent_shape] for efficiency.
+    """
+
+    def __init__(self, num_classes, bank_size, latent_shape, device):
+        self.num_classes = num_classes
+        self.bank_size = bank_size
+        self.device = device
+        # Pre-allocate storage — ~2 GB for 1000 classes × 128 × (4,32,32) in fp32
+        self.storage = torch.zeros(
+            num_classes, bank_size, *latent_shape, device=device
+        )
+        # Per-class circular write pointer and valid count (kept on CPU for indexing)
+        self.ptr = torch.zeros(num_classes, dtype=torch.long)
+        self.count = torch.zeros(num_classes, dtype=torch.long)
+
+    @torch.no_grad()
+    def update(self, latents, labels):
+        """Add a batch of latents to their respective class banks.
+
+        Args:
+            latents: [B, *latent_shape] — cached latents from dataloader.
+            labels:  [B] — integer class labels.
+        """
+        for i in range(latents.shape[0]):
+            c = labels[i].item()
+            idx = self.ptr[c].item() % self.bank_size
+            self.storage[c, idx].copy_(latents[i])
+            self.ptr[c] += 1
+            if self.count[c] < self.bank_size:
+                self.count[c] += 1
+
+    @torch.no_grad()
+    def sample(self, class_label, n_samples):
+        """Sample n_samples from the bank for *class_label*.
+
+        Samples with replacement if n_samples > number of stored entries.
+        Returns [n_samples, *latent_shape] on self.device, or None if empty.
+        """
+        n_valid = self.count[class_label].item()
+        if n_valid == 0:
+            return None
+        indices = torch.randint(0, n_valid, (n_samples,))
+        return self.storage[class_label, indices]  # already on device
+
+    def n_valid(self, class_label):
+        """Number of valid entries stored for *class_label*."""
+        return self.count[class_label].item()
 
 
 # ─────────────────────────────────────────────────────────
@@ -405,6 +464,10 @@ def main(args):
     eval_fid_samples = train_cfg.get("eval_fid_samples", 50000)
     eval_batch_size = train_cfg.get("eval_bsz_per_gpu", 64)
 
+    # Positive sample config
+    N_pos = train_cfg.get("n_pos", 1)
+    pos_bank_size = train_cfg.get("pos_bank_size", 128)
+
     # Memory optimization config
     grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
     use_bf16 = train_cfg.get("use_bf16", False)
@@ -416,6 +479,18 @@ def main(args):
         scale_dist_normed=attn_cfg.get("scale_dist_normed", True),
         R_list=attn_cfg.get("R_list", [0.02, 0.05, 0.2]),
     )
+
+    # ── Per-class memory bank for multiple positives ──
+    mem_bank = ClassMemoryBank(
+        num_classes=num_classes,
+        bank_size=pos_bank_size,
+        latent_shape=input_shape,
+        device=device,
+    )
+    if is_main:
+        bank_mem_mb = (num_classes * pos_bank_size * torch.zeros(input_shape).numel() * 4) / 1e6
+        print(f"Memory bank: {num_classes} classes × {pos_bank_size} slots "
+              f"(~{bank_mem_mb:.0f} MB, N_pos={N_pos})")
 
     # ── Training loop (step-based, not epoch-based) ──
     global_step = start_step
@@ -437,7 +512,7 @@ def main(args):
         print(f"  Warmup steps:         {warmup_steps}")
         print(f"  Save every:           {save_every} steps")
         print(f"  Eval FID every:       {eval_every} steps ({eval_fid_samples} samples)")
-        print(f"  Nc={Nc}, N_neg={N_neg} (positives from batch)")
+        print(f"  Nc={Nc}, N_pos={N_pos}, N_neg={N_neg}")
         print(f"  Grad accum steps:     {grad_accum_steps} (micro_Nc ≈ {max(1, Nc // grad_accum_steps)})")
         print(f"  Mixed precision:      {'bf16' if use_bf16 else 'fp32'}")
         print(f"  Feat micro-batch:     {feat_mb} (VAE+MoCo sub-batch, checkpointed)")
@@ -472,8 +547,12 @@ def main(args):
             latents = latents.to(device, non_blocking=True)  # [B, 4, 32, 32]
             labels = labels.to(device, non_blocking=True)    # [B]
 
+            # ── Update per-class memory bank with current batch ──
+            # This must happen BEFORE class selection so even on the
+            # very first step, selected classes already have ≥1 entry.
+            mem_bank.update(latents, labels)
+
             # ── Group batch by class, pick up to Nc classes ──
-            # No memory bank: positives come directly from the data batch.
             unique_labels = labels.unique()
             if len(unique_labels) < Nc:
                 selected = unique_labels
@@ -502,14 +581,12 @@ def main(args):
 
                 for c in class_chunk:
                     c_val = c.item()
-                    mask = (labels == c)
-                    target_latents = latents[mask]  # [N_c, 4, 32, 32]
-                    if target_latents.shape[0] == 0:
-                        continue
 
-                    # Pick 1 random positive per class (no memory bank)
-                    rand_idx = torch.randint(0, target_latents.shape[0], (1,), device=device)
-                    pos_list.append(target_latents[rand_idx])  # [1, 4, 32, 32]
+                    # Draw N_pos positives from the memory bank
+                    pos_samples = mem_bank.sample(c_val, N_pos)
+                    if pos_samples is None:
+                        continue  # class not yet in the bank (shouldn't happen after update)
+                    pos_list.append(pos_samples)  # [N_pos, 4, 32, 32]
 
                     # ════════════════════════════════════════════
                     # Step B: (class + noise) -> DitGen -> generated_latents
@@ -527,7 +604,7 @@ def main(args):
                 if len(valid_classes) == 0:
                     continue
 
-                target_batch = torch.stack(pos_list, dim=0)       # [chunk_valid, 1, 4, 32, 32]
+                target_batch = torch.stack(pos_list, dim=0)       # [chunk_valid, N_pos, 4, 32, 32]
                 gen_batch = torch.stack(gen_list, dim=0)           # [chunk_valid, N_neg, 4, 32, 32]
 
                 # ════════════════════════════════════════════════

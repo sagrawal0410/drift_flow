@@ -92,7 +92,11 @@ train:
       scale_dist_normed: true
       R_list: [0.02, 0.05, 0.2]
 
-  # Sample queue / memory bank (all 0 = just use data batch directly)
+  # Positive sample memory bank
+  n_pos: 16                 # N_pos: positive samples per class (drawn from memory bank)
+  pos_bank_size: 128        # per-class FIFO capacity (stores recent latents across steps)
+
+  # Sample queue / memory bank (legacy — unused when n_pos > 0)
   n_cond_samples: 0
   n_gen_bank_samples: 0
   n_uncond_samples: 0
