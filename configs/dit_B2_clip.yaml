@@ -71,7 +71,7 @@ train:
   feat_micro_batch: 64           # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
-  eval_gen_per_step: 20         # FID evaluation every 5k steps
+  eval_gen_per_step: 500         # FID evaluation every 5k steps
   eval_fid_samples: 50000         # 50k generated samples for FID
   lr_schedule:
     lr: 0.0015                 # 2e-4
