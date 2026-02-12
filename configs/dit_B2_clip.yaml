@@ -64,7 +64,8 @@ model:
 train:
   n_steps: 100000               # 50k training steps
   total_batch_size: 512          # dataloader batch per GPU (just needs enough for Nc unique classes)
-  compile_model: false
+  compile_model: true          # set true to torch.compile generator + VAE + MoCo
+  compile_mode: "default"       # "default", "reduce-overhead", or "max-autotune"
   use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
   grad_accum_steps: 16            # accumulate over 8 class micro-batches (Nc/8 classes each)
   feat_micro_batch: 64           # max samples per VAE+MoCo sub-batch (with gradient checkpointing)

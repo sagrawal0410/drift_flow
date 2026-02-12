@@ -364,6 +364,14 @@ def main(args):
     n_param_tensors = sum(1 for _ in generator.parameters())
     print(f"[Rank {rank}] generator has {n_param_tensors} parameter tensors")
 
+    # ── Optional torch.compile (before DDP) ──
+    compile_model = cfg.train.get("compile_model", False)
+    compile_mode = cfg.train.get("compile_mode", "default")
+    if compile_model:
+        generator = torch.compile(generator, mode=compile_mode)
+        if is_main:
+            print(f"Generator compiled with torch.compile (mode={compile_mode})")
+
     if world_size > 1:
         dist.barrier()  # ensure all ranks constructed the model
         generator = DDP(generator, device_ids=[local_rank])
@@ -392,16 +400,23 @@ def main(args):
     # ── SD-VAE decoder (frozen, but gradients flow through for gen path) ──
     # Loaded eagerly because the MoCo v2 feature pipeline needs it every step
     train_vae = build_vae_decoder(device, for_training=True)
+    if compile_model:
+        # Compile decode() specifically — we never call vae.forward()
+        train_vae.decode = torch.compile(train_vae.decode, mode=compile_mode)
     if is_main:
-        print("Loaded SD-VAE decoder for MoCo v2 feature pipeline (frozen, grad-through)")
+        compiled_tag = " [compiled]" if compile_model else ""
+        print(f"Loaded SD-VAE decoder for MoCo v2 feature pipeline (frozen, grad-through){compiled_tag}")
 
     # ── MoCo v2 backbone (frozen, but gradients flow through for gen path) ──
     moco_cfg = cfg.model.get("moco_v2", {})
     moco_checkpoint = moco_cfg.get("checkpoint_path", "")
     moco_backbone = build_moco_v2_backbone(moco_checkpoint, device)
+    if compile_model:
+        moco_backbone = torch.compile(moco_backbone, mode=compile_mode)
     if is_main:
         moco_params = sum(p.numel() for p in moco_backbone.parameters()) / 1e6
-        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen)")
+        compiled_tag = " [compiled]" if compile_model else ""
+        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen){compiled_tag}")
 
     # ── Feature extractor: MoCo v2 pixel-space features ──
     # Pipeline: latents → VAE decode → pixel images → MoCo v2 → 2048-d features
