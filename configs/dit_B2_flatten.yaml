@@ -106,7 +106,7 @@ train:
 
   # Class conditioning
   n_classes: 1000
-  n_class_labels: 8            # Nc: classes sampled per step
+  n_class_labels: 64            # Nc: classes sampled per step
 
 # ── Optimizer (AdamW) ──
 optimizer:
