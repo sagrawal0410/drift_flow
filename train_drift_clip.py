@@ -400,11 +400,7 @@ def main(args):
     # ── SD-VAE decoder (frozen, but gradients flow through for gen path) ──
     # Loaded eagerly because the MoCo v2 feature pipeline needs it every step
     train_vae = build_vae_decoder(device, for_training=True)
-    if compile_model:
-        # Compile decode() specifically — we never call vae.forward()
-        train_vae.decode = torch.compile(train_vae.decode, mode=compile_mode)
     if is_main:
-        compiled_tag = " [compiled]" if compile_model else ""
         print(f"Loaded SD-VAE decoder for MoCo v2 feature pipeline (frozen, grad-through){compiled_tag}")
 
     # ── MoCo v2 backbone (frozen, but gradients flow through for gen path) ──
