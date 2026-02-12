@@ -46,6 +46,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from diffusers import AutoencoderKL
 import torchvision.models as tv_models
 
+import torch.utils.checkpoint as cp
+
 from config import load_config
 from utils.misc import add_weight_decay
 from dataset.cache_dataset import CachedFolder
@@ -109,13 +111,19 @@ class MoCoV2PixelFeatures(FeatureExtractor):
     from the contrastive loss back to the generator for generated samples.
     For target samples, the parent FeatureExtractor.forward() wraps
     extraction in torch.no_grad() automatically.
+
+    Memory optimizations:
+    - Sub-batches the VAE+MoCo forward into chunks of `micro_batch`
+    - Uses gradient checkpointing: only stores input/output per chunk,
+      recomputes VAE+MoCo activations during backward (trades compute for memory).
     """
 
-    def __init__(self, input_shape, vae, moco_backbone):
+    def __init__(self, input_shape, vae, moco_backbone, micro_batch=64):
         super().__init__(input_shape)
         self.vae = vae
         self.moco = moco_backbone
         self.cache_scaling = 0.18125
+        self.micro_batch = micro_batch
         # ImageNet normalization constants (for MoCo v2 input)
         self.register_buffer(
             "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -124,18 +132,37 @@ class MoCoV2PixelFeatures(FeatureExtractor):
             "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
+    def _f_map_chunk(self, x):
+        """Process one micro-batch: latents → VAE decode → MoCo v2 features.
+        Separated so it can be wrapped by gradient checkpointing.
+        """
+        images = self.vae.decode(x / self.cache_scaling).sample
+        images = ((images + 1) / 2).clamp(0, 1)  # [mb, 3, 256, 256]
+        images = (images - self.img_mean) / self.img_std
+        features = self.moco(images)  # [mb, 2048]
+        return features
+
     def f_map(self, x):
         """
         x: [B, 4, 32, 32] latents (scaled by 0.18125)
         Returns: dict with 'moco' → [B, 1, 2048]
+
+        Processes in micro-batches with gradient checkpointing to keep
+        only one chunk's VAE+MoCo activations alive at a time.
         """
-        # Decode latents → pixel images [-1, 1] → [0, 1]
-        images = self.vae.decode(x / self.cache_scaling).sample
-        images = ((images + 1) / 2).clamp(0, 1)  # [B, 3, 256, 256]
-        # ImageNet normalize for MoCo v2
-        images = (images - self.img_mean) / self.img_std
-        # Extract MoCo v2 features (2048-d after global avg pool)
-        features = self.moco(images)  # [B, 2048]
+        B = x.shape[0]
+        mb = self.micro_batch
+        all_features = []
+        for i in range(0, B, mb):
+            chunk = x[i:i + mb]
+            if torch.is_grad_enabled() and chunk.requires_grad:
+                # Gradient checkpointing: recompute VAE+MoCo during backward
+                feat = cp.checkpoint(self._f_map_chunk, chunk, use_reentrant=False)
+            else:
+                # No grad path (target samples) — no need to checkpoint
+                feat = self._f_map_chunk(chunk)
+            all_features.append(feat)
+        features = torch.cat(all_features, dim=0)  # [B, 2048]
         return {"moco": features.unsqueeze(1)}  # [B, 1, 2048]
 
     def name(self):
@@ -320,8 +347,9 @@ def main(args):
     # ── Feature extractor: MoCo v2 pixel-space features ──
     # Pipeline: latents → VAE decode → pixel images → MoCo v2 → 2048-d features
     input_shape = tuple(cfg.model.get("input_shape", [4, 32, 32]))
+    feat_mb = cfg.train.get("feat_micro_batch", 64)
     moco_feature_extractor = MoCoV2PixelFeatures(
-        input_shape, vae=train_vae, moco_backbone=moco_backbone
+        input_shape, vae=train_vae, moco_backbone=moco_backbone, micro_batch=feat_mb
     ).to(device)
     feature_extractors = [moco_feature_extractor]
     if is_main:
@@ -377,6 +405,10 @@ def main(args):
     eval_fid_samples = train_cfg.get("eval_fid_samples", 50000)
     eval_batch_size = train_cfg.get("eval_bsz_per_gpu", 64)
 
+    # Memory optimization config
+    grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
+    use_bf16 = train_cfg.get("use_bf16", False)
+
     # Loss config (from config train.forward_dict.attn_dict)
     contra_dict = dict(
         kernel_type=attn_cfg.get("kernel_type", "attn_new"),
@@ -406,6 +438,9 @@ def main(args):
         print(f"  Save every:           {save_every} steps")
         print(f"  Eval FID every:       {eval_every} steps ({eval_fid_samples} samples)")
         print(f"  Nc={Nc}, N_neg={N_neg} (positives from batch)")
+        print(f"  Grad accum steps:     {grad_accum_steps} (micro_Nc ≈ {max(1, Nc // grad_accum_steps)})")
+        print(f"  Mixed precision:      {'bf16' if use_bf16 else 'fp32'}")
+        print(f"  Feat micro-batch:     {feat_mb} (VAE+MoCo sub-batch, checkpointed)")
         print(f"  CFG alpha:            {cfg_scale} (1.0 = no CFG)")
         print(f"  EMA decay (eval):     {ema_decay}")
         print(f"  Grad clip:            {clip_grad}")
@@ -446,72 +481,94 @@ def main(args):
                 perm = torch.randperm(len(unique_labels), device=device)[:Nc]
                 selected = unique_labels[perm]
 
-            pos_list = []
-            gen_list = []
-            valid_classes = []
+            # ── Split classes into micro-batches for gradient accumulation ──
+            # Each micro-batch processes a subset of classes independently.
+            # The contrastive loss is per-class, so accumulation is exact.
+            n_selected = len(selected)
+            micro_Nc = max(1, math.ceil(n_selected / grad_accum_steps))
+            class_chunks = [selected[i:i+micro_Nc]
+                            for i in range(0, n_selected, micro_Nc)]
+            n_chunks = len(class_chunks)
 
-            for c in selected:
-                c_val = c.item()
-                mask = (labels == c)
-                target_latents = latents[mask]  # [N_c, 4, 32, 32]
-                if target_latents.shape[0] == 0:
+            optimizer.zero_grad()
+            accum_loss = 0.0
+            accum_info = {}
+            total_valid = 0
+
+            for chunk_idx, class_chunk in enumerate(class_chunks):
+                pos_list = []
+                gen_list = []
+                valid_classes = []
+
+                for c in class_chunk:
+                    c_val = c.item()
+                    mask = (labels == c)
+                    target_latents = latents[mask]  # [N_c, 4, 32, 32]
+                    if target_latents.shape[0] == 0:
+                        continue
+
+                    # Pick 1 random positive per class (no memory bank)
+                    rand_idx = torch.randint(0, target_latents.shape[0], (1,), device=device)
+                    pos_list.append(target_latents[rand_idx])  # [1, 4, 32, 32]
+
+                    # ════════════════════════════════════════════
+                    # Step B: (class + noise) -> DitGen -> generated_latents
+                    #   Class-conditioned, no CFG (alpha=1.0)
+                    #   bf16 autocast keeps activations in half-precision
+                    # ════════════════════════════════════════════
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
+                        class_cond = torch.full((N_neg,), c_val, dtype=torch.long, device=device)
+                        gen_output = gen_model(class_cond, cfg_scale=cfg_scale)
+                        generated_latents = gen_output["samples"]  # [N_neg, 4, 32, 32]
+                    gen_list.append(generated_latents)
+
+                    valid_classes.append(c_val)
+
+                if len(valid_classes) == 0:
                     continue
 
-                # Pick 1 random positive per class (no memory bank)
-                rand_idx = torch.randint(0, target_latents.shape[0], (1,), device=device)
-                pos_list.append(target_latents[rand_idx])  # [1, 4, 32, 32]
+                target_batch = torch.stack(pos_list, dim=0)       # [chunk_valid, 1, 4, 32, 32]
+                gen_batch = torch.stack(gen_list, dim=0)           # [chunk_valid, N_neg, 4, 32, 32]
 
-                # ════════════════════════════════════════════
-                # Step B: (class + noise) -> DitGen -> generated_latents
-                #   Class-conditioned, no CFG (alpha=1.0)
-                # ════════════════════════════════════════════
-                class_cond = torch.full((N_neg,), c_val, dtype=torch.long, device=device)
-                gen_output = gen_model(class_cond, cfg_scale=cfg_scale)
-                generated_latents = gen_output["samples"]  # [N_neg, 4, 32, 32]
-                gen_list.append(generated_latents)
+                # ════════════════════════════════════════════════
+                # Step C: Feature extraction + contrastive loss
+                #   MoCoV2PixelFeatures uses gradient checkpointing +
+                #   sub-batching internally for memory efficiency.
+                #   Target features extracted under no_grad (by FeatureExtractor).
+                #   Generated features keep full gradient back to DitGen.
+                # ════════════════════════════════════════════════
+                chunk_loss = torch.zeros(len(valid_classes), device=device)
+                chunk_info = {}
 
-                valid_classes.append(c_val)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
+                    for feat in feature_extractors:
+                        loss, info = feat(
+                            target=target_batch,
+                            recon=gen_batch,
+                            contra_dict=contra_dict,
+                        )
+                        chunk_loss = chunk_loss + loss
+                        for k, v in info.items():
+                            chunk_info[f"{feat.name()}/{k}"] = v
 
-            if len(valid_classes) == 0:
+                # Scale loss for gradient accumulation and backward
+                avg_chunk_loss = chunk_loss.mean() / n_chunks
+                avg_chunk_loss.backward()
+
+                # Accumulate metrics for logging
+                accum_loss += chunk_loss.mean().item() / n_chunks
+                for k, v in chunk_info.items():
+                    val = v.item() if isinstance(v, torch.Tensor) else v
+                    accum_info[k] = accum_info.get(k, 0) + val / n_chunks
+                total_valid += len(valid_classes)
+
+            if total_valid == 0:
                 continue
 
-            target_batch = torch.stack(pos_list, dim=0)       # [B_valid, 1, 4, 32, 32]
-            gen_batch = torch.stack(gen_list, dim=0)           # [B_valid, N_neg, 4, 32, 32]
-
             # ════════════════════════════════════════════════
-            # Step C: Feature extraction + contrastive loss
-            #   Feature extractors are frozen (no learnable params)
-            #   but NOT wrapped in no_grad — gradients flow through
-            #   the feature transform back to the generator.
-            #
-            #   FeatureExtractor.forward internally:
-            #     - target features extracted under torch.no_grad()
-            #     - recon (generated) features keep full gradient
-            #     - old_recon=None → defaults to recon.detach()
-            #       (current generated samples, detached)
-            #     - calls group_contra_loss from energy_loss.py
+            # Step D: Gradient clipping + optimizer step
+            #   Gradients accumulated from all class micro-batches
             # ════════════════════════════════════════════════
-            total_loss = torch.zeros(len(valid_classes), device=device)
-            all_info = {}
-
-            for feat in feature_extractors:
-                loss, info = feat(
-                    target=target_batch,         # positive: real latents (no grad)
-                    recon=gen_batch,              # generated: DitGen output (has grad)
-                    contra_dict=contra_dict,
-                    # old_recon omitted → defaults to recon.detach()
-                )
-                total_loss = total_loss + loss
-                for k, v in info.items():
-                    all_info[f"{feat.name()}/{k}"] = v
-
-            avg_loss = total_loss.mean()
-
-            # ════════════════════════════════════════════════
-            # Step D: Backprop -> update DitGen only
-            # ════════════════════════════════════════════════
-            optimizer.zero_grad()
-            avg_loss.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
             optimizer.step()
 
@@ -522,22 +579,19 @@ def main(args):
 
             # ── Logging ──
             log_payload = {
-                "train/loss": avg_loss.item(),
+                "train/loss": accum_loss,
                 "train/lr": optimizer.param_groups[0]['lr'],
                 "train/step": global_step,
             }
-            for k, v in all_info.items():
-                if isinstance(v, torch.Tensor):
-                    log_payload[f"train/{k}"] = v.item()
-                else:
-                    log_payload[f"train/{k}"] = v
+            for k, v in accum_info.items():
+                log_payload[f"train/{k}"] = v
             logger.log_dict(log_payload, step=global_step)
             logger.set_step(global_step)
 
             if is_main and global_step % 100 == 0:
                 cur_lr = optimizer.param_groups[0]['lr']
                 log_str = (f"[epoch {epoch}][step {global_step}/{total_steps}] "
-                           f"loss={avg_loss.item():.6f} lr={cur_lr:.2e}")
+                           f"loss={accum_loss:.6f} lr={cur_lr:.2e}")
                 print(log_str)
 
             # ── Checkpoint saving ──

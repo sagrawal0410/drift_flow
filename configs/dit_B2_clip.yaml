@@ -63,9 +63,11 @@ model:
 # ── Training parameters ──
 train:
   n_steps: 100000               # 50k training steps
-  total_batch_size: 4096         # Nc * N_neg = 8 * 8
+  total_batch_size: 512          # dataloader batch per GPU (just needs enough for Nc unique classes)
   compile_model: false
-  use_bf16: false
+  use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
+  grad_accum_steps: 8            # accumulate over 8 class micro-batches (Nc/8 classes each)
+  feat_micro_batch: 64           # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
   eval_gen_per_step: 5000         # FID evaluation every 5k steps
