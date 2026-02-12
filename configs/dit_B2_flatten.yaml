@@ -63,7 +63,7 @@ model:
 # ── Training parameters ──
 train:
   n_steps: 100000               # 50k training steps
-  total_batch_size: 64         # Nc * N_neg = 8 * 8
+  total_batch_size: 4096         # Nc * N_neg = 8 * 8
   compile_model: false
   use_bf16: false
   eval_bsz_per_gpu: 64
@@ -83,7 +83,7 @@ train:
 
   # Drifting loss forward config
   forward_dict:
-    recon: 8                   # N_neg: generated samples per class
+    recon: 64                   # N_neg: generated samples per class
     attn_dict:
       kernel_type: "attn_new"
       sample_norm: true
