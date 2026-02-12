@@ -62,7 +62,7 @@ model:
 
 # ── Training parameters ──
 train:
-  n_steps: 30000               # 30k training steps
+  n_steps: 100000               # 50k training steps
   total_batch_size: 64         # Nc * N_neg = 8 * 8
   compile_model: false
   use_bf16: false
