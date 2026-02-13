@@ -8,7 +8,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=80
 #SBATCH --mem=256G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/train_clip_%j.out
 #SBATCH --error=logs/train_clip_%j.err
 
