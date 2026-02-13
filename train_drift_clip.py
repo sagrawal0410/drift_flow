@@ -99,31 +99,58 @@ def build_moco_v2_backbone(checkpoint_path="", device="cpu"):
     return backbone.to(device)
 
 
-class MoCoV2PixelFeatures(FeatureExtractor):
-    """Feature extractor that decodes latents → pixels via SD-VAE,
-    then extracts MoCo v2 features.
+class MoCoV2MultiScaleFeatures(FeatureExtractor):
+    """Multi-scale feature extractor following Section A.5 of the drifting paper.
 
-    Operates in latent space (input_shape = (4, 32, 32)) but internally
-    decodes to pixel space and runs through the MoCo v2 ResNet-50 backbone.
+    Pipeline: latents → VAE decode → pixel images → MoCo v2 ResNet-50
 
-    Both the VAE decoder and MoCo backbone are frozen (requires_grad=False),
-    but NOT wrapped in torch.no_grad() — gradients flow through them
-    from the contrastive loss back to the generator for generated samples.
-    For target samples, the parent FeatureExtractor.forward() wraps
-    extraction in torch.no_grad() automatically.
+    Extracts feature maps at every 2 residual blocks + final layer in each
+    stage of the ResNet-50, plus the VAE decoder output (encoder input).
 
-    Memory optimizations:
-    - Sub-batches the VAE+MoCo forward into chunks of `micro_batch`
-    - Uses gradient checkpointing: only stores input/output per chunk,
-      recomputes VAE+MoCo activations during backward (trades compute for memory).
+    For each feature map [B, C, H, W], produces (per A.5):
+      (a) H×W per-location vectors (each C-dim)
+      (b) 1 global mean + 1 global std (each C-dim)
+      (c) (H/2)×(W/2) means + stds from 2×2 patches (each C-dim)
+      (d) (H/4)×(W/4) means + stds from 4×4 patches (each C-dim)
+
+    For the encoder input (pixel images), computes mean(x²) per channel.
+
+    Each feature type at each extraction point gets its own independent
+    drifting loss (computed by FeatureExtractor.forward → group_contra_loss).
+
+    ResNet-50 (bottleneck, [3,4,6,3]) extraction points:
+      layer1: after block 1, block 2 (final)     → 64×64×256   (2 maps)
+      layer2: after block 1, block 3 (final)     → 32×32×512   (2 maps)
+      layer3: after block 1, 3, block 5 (final)  → 16×16×1024  (3 maps)
+      layer4: after block 1, block 2 (final)     → 8×8×2048    (2 maps)
+      Total: 9 feature maps × 4 types + 1 input  = 37 loss terms
+
+    Memory optimizations (same as before):
+      - Sub-batches VAE+MoCo forward into chunks of `micro_batch`
+      - Gradient checkpointing: recompute during backward
     """
+
+    # (layer_name, extract_after_block_indices)
+    # "every 2 residual blocks + final" per stage of ResNet-50 [3,4,6,3]
+    STAGES = [
+        ("layer1", [1, 2]),       # 3 blocks → after block 1, 2 (final)
+        ("layer2", [1, 3]),       # 4 blocks → after block 1, 3 (final)
+        ("layer3", [1, 3, 5]),    # 6 blocks → after block 1, 3, 5 (final)
+        ("layer4", [1, 2]),       # 3 blocks → after block 1, 2 (final)
+    ]
 
     def __init__(self, input_shape, vae, moco_backbone, micro_batch=64):
         super().__init__(input_shape)
         self.vae = vae
-        self.moco = moco_backbone
         self.cache_scaling = 0.18125
         self.micro_batch = micro_batch
+
+        # Unwrap torch.compile wrapper if present — we need direct layer access
+        if hasattr(moco_backbone, '_orig_mod'):
+            self.moco = moco_backbone._orig_mod
+        else:
+            self.moco = moco_backbone
+
         # ImageNet normalization constants (for MoCo v2 input)
         self.register_buffer(
             "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -132,38 +159,138 @@ class MoCoV2PixelFeatures(FeatureExtractor):
             "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
-    def _f_map_chunk(self, x):
-        """Process one micro-batch: latents → VAE decode → MoCo v2 features.
-        Separated so it can be wrapped by gradient checkpointing.
+        # Precompute ordered feature names (needed for tuple↔dict in checkpointing)
+        self._feature_names = self._build_feature_names()
+
+    def _build_feature_names(self):
+        """Build ordered list of all feature names returned by f_map."""
+        names = []
+        for layer_name, extract_blocks in self.STAGES:
+            for bidx in extract_blocks:
+                prefix = f"{layer_name}_b{bidx}"
+                names.extend([
+                    f"{prefix}_loc", f"{prefix}_global",
+                    f"{prefix}_p2", f"{prefix}_p4",
+                ])
+        names.append("input_x2mean")
+        return names
+
+    @staticmethod
+    def _patch_stats(feat, patch_size):
+        """Compute mean and std over non-overlapping patches.
+
+        Args:
+            feat: [B, C, H, W]
+            patch_size: int
+        Returns:
+            [B, 2 * N_patches, C]  where N_patches = (H//p) * (W//p)
+            First N_patches entries are means, next N_patches are stds.
         """
+        B, C, H, W = feat.shape
+        p = patch_size
+        Hp, Wp = H // p, W // p
+        # Reshape into patches: [B, C, Hp, p, Wp, p] → [B, Hp*Wp, C, p²]
+        f = feat[:, :, :Hp * p, :Wp * p]
+        f = f.reshape(B, C, Hp, p, Wp, p)
+        f = f.permute(0, 2, 4, 1, 3, 5).reshape(B, Hp * Wp, C, p * p)
+        means = f.mean(-1)   # [B, N, C]
+        stds = f.std(-1)     # [B, N, C]
+        return torch.cat([means, stds], dim=1)   # [B, 2N, C]
+
+    def _feature_vectors(self, feat, prefix):
+        """Extract (a)–(d) feature vectors from one feature map.
+
+        Args:
+            feat: [B, C, H, W]
+        Returns:
+            dict  {name: [B, F, C]}   (4 entries)
+        """
+        B, C, H, W = feat.shape
+        out = {}
+
+        # (a) Per-location vectors: [B, H*W, C]
+        out[f"{prefix}_loc"] = feat.reshape(B, C, H * W).permute(0, 2, 1)
+
+        # (b) Global mean + std: [B, 2, C]
+        gmean = feat.mean(dim=(2, 3))  # [B, C]
+        gstd = feat.std(dim=(2, 3))    # [B, C]
+        out[f"{prefix}_global"] = torch.stack([gmean, gstd], dim=1)
+
+        # (c) 2×2 patch means + stds
+        if H >= 2 and W >= 2:
+            out[f"{prefix}_p2"] = self._patch_stats(feat, 2)
+        else:
+            out[f"{prefix}_p2"] = torch.stack([gmean, gstd], dim=1)
+
+        # (d) 4×4 patch means + stds
+        if H >= 4 and W >= 4:
+            out[f"{prefix}_p4"] = self._patch_stats(feat, 4)
+        else:
+            out[f"{prefix}_p4"] = torch.stack([gmean, gstd], dim=1)
+
+        return out
+
+    def _f_map_chunk(self, x):
+        """Process one micro-batch: latents → VAE → MoCo ResNet-50 → multi-scale features.
+
+        Returns a tuple of tensors in self._feature_names order
+        (torch.utils.checkpoint requires tensor/tuple output).
+        """
+        # ── Decode latents → pixel images ──
         images = self.vae.decode(x / self.cache_scaling).sample
-        images = ((images + 1) / 2).clamp(0, 1)  # [mb, 3, 256, 256]
-        images = (images - self.img_mean) / self.img_std
-        features = self.moco(images)  # [mb, 2048]
-        return features
+        images = ((images + 1) / 2).clamp(0, 1)        # [mb, 3, 256, 256]
+        images_normed = (images - self.img_mean) / self.img_std
+
+        result = {}
+
+        # ── Run ResNet-50 stem ──
+        moco = self.moco
+        h = moco.conv1(images_normed)
+        h = moco.bn1(h)
+        h = moco.relu(h)
+        h = moco.maxpool(h)  # [mb, 64, 64, 64]
+
+        # ── Run each stage, extracting feature maps at specified blocks ──
+        for layer_name, extract_blocks in self.STAGES:
+            layer = getattr(moco, layer_name)
+            for bidx, block in enumerate(layer):
+                h = block(h)
+                if bidx in extract_blocks:
+                    prefix = f"{layer_name}_b{bidx}"
+                    result.update(self._feature_vectors(h, prefix))
+
+        # ── Encoder input feature: mean of x² per channel → [mb, 1, 3] ──
+        result["input_x2mean"] = (images ** 2).mean(dim=(2, 3)).unsqueeze(1)
+
+        # Return as ordered tuple for checkpoint compatibility
+        return tuple(result[name] for name in self._feature_names)
 
     def f_map(self, x):
         """
         x: [B, 4, 32, 32] latents (scaled by 0.18125)
-        Returns: dict with 'moco' → [B, 1, 2048]
+        Returns: dict {name: [B, F, D]} with 37 entries (9 maps × 4 types + 1 input).
 
-        Processes in micro-batches with gradient checkpointing to keep
-        only one chunk's VAE+MoCo activations alive at a time.
+        Processes in micro-batches with gradient checkpointing.
         """
         B = x.shape[0]
         mb = self.micro_batch
-        all_features = []
+        all_chunks = []
+
         for i in range(0, B, mb):
             chunk = x[i:i + mb]
             if torch.is_grad_enabled() and chunk.requires_grad:
-                # Gradient checkpointing: recompute VAE+MoCo during backward
-                feat = cp.checkpoint(self._f_map_chunk, chunk, use_reentrant=False)
+                feat_tuple = cp.checkpoint(
+                    self._f_map_chunk, chunk, use_reentrant=False
+                )
             else:
-                # No grad path (target samples) — no need to checkpoint
-                feat = self._f_map_chunk(chunk)
-            all_features.append(feat)
-        features = torch.cat(all_features, dim=0)  # [B, 2048]
-        return {"moco": features.unsqueeze(1)}  # [B, 1, 2048]
+                feat_tuple = self._f_map_chunk(chunk)
+            all_chunks.append(feat_tuple)
+
+        # Concatenate along batch dim and rebuild dict
+        result = {}
+        for idx, name in enumerate(self._feature_names):
+            result[name] = torch.cat([c[idx] for c in all_chunks], dim=0)
+        return result
 
     def name(self):
         return "moco_v2"
@@ -407,18 +534,19 @@ def main(args):
     moco_cfg = cfg.model.get("moco_v2", {})
     moco_checkpoint = moco_cfg.get("checkpoint_path", "")
     moco_backbone = build_moco_v2_backbone(moco_checkpoint, device)
-    if compile_model:
-        moco_backbone = torch.compile(moco_backbone, mode=compile_mode)
+    # Note: MoCo backbone is NOT compiled because the multi-scale feature
+    # extractor needs direct layer-by-layer access to extract intermediate maps.
     if is_main:
         moco_params = sum(p.numel() for p in moco_backbone.parameters()) / 1e6
-        compiled_tag = " [compiled]" if compile_model else ""
-        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen)")
+        print(f"MoCo v2 backbone: {moco_params:.1f}M params (frozen, multi-scale)")
 
-    # ── Feature extractor: MoCo v2 pixel-space features ──
-    # Pipeline: latents → VAE decode → pixel images → MoCo v2 → 2048-d features
+    # ── Feature extractor: MoCo v2 multi-scale pixel-space features (A.5) ──
+    # Pipeline: latents → VAE decode → pixels → MoCo ResNet-50 layer-by-layer
+    #   → 9 feature maps (every 2 blocks + final per stage) × 4 feature types
+    #   + 1 input-level feature = 37 independent drifting loss terms
     input_shape = tuple(cfg.model.get("input_shape", [4, 32, 32]))
     feat_mb = cfg.train.get("feat_micro_batch", 64)
-    moco_feature_extractor = MoCoV2PixelFeatures(
+    moco_feature_extractor = MoCoV2MultiScaleFeatures(
         input_shape, vae=train_vae, moco_backbone=moco_backbone, micro_batch=feat_mb
     ).to(device)
     feature_extractors = [moco_feature_extractor]
@@ -530,7 +658,9 @@ def main(args):
         print(f"  CFG alpha:            {cfg_scale} (1.0 = no CFG)")
         print(f"  EMA decay (eval):     {ema_decay}")
         print(f"  Grad clip:            {clip_grad}")
-        print(f"  Feature pipeline:     latents → VAE decode → MoCo v2 (2048-d)")
+        n_feat = len(moco_feature_extractor._feature_names)
+        print(f"  Feature pipeline:     latents → VAE decode → MoCo ResNet-50 (multi-scale, A.5)")
+        print(f"  Feature loss terms:   {n_feat} (9 maps × 4 types + 1 input)")
         print(f"  MoCo checkpoint:      {moco_checkpoint or '(ImageNet-supervised R50)'}")
         print(f"  Loss config:          {contra_dict}")
         print(f"{'='*60}\n")
@@ -620,8 +750,8 @@ def main(args):
 
                 # ════════════════════════════════════════════════
                 # Step C: Feature extraction + contrastive loss
-                #   MoCoV2PixelFeatures uses gradient checkpointing +
-                #   sub-batching internally for memory efficiency.
+                #   MoCoV2MultiScaleFeatures uses gradient checkpointing +
+                #   sub-batching internally for memory efficiency (A.5).
                 #   Target features extracted under no_grad (by FeatureExtractor).
                 #   Generated features keep full gradient back to DitGen.
                 # ════════════════════════════════════════════════
