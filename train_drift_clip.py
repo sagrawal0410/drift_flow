@@ -420,6 +420,9 @@ def make_eval_generator(model, vae, cfg_scale, device):
         latents = output["samples"]  # [B, 4, 32, 32]
         # Decode through SD-VAE (undo cache scaling)
         images = vae.decode(latents / cache_scaling).sample
+        # Early in training the generator can produce extreme latents that
+        # decode to NaN/Inf — replace before clamping so FID eval doesn't crash.
+        images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=-1.0)
         images = ((images + 1) / 2).clamp(0, 1)  # [B, 3, 256, 256]
         return images
 
@@ -787,8 +790,15 @@ def main(args):
             # Step D: Gradient clipping + optimizer step
             #   Gradients accumulated from all class micro-batches
             # ════════════════════════════════════════════════
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
-            optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
+
+            # Skip update if gradients are NaN/Inf (early training instability)
+            if not torch.isfinite(grad_norm):
+                if is_main:
+                    print(f"[step {global_step}] WARNING: non-finite grad norm ({grad_norm:.4f}), skipping update")
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
 
             # ── Update EMA (used for evaluation only, not bootstrap) ──
             ema.update(gen_model)
