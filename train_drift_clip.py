@@ -800,7 +800,7 @@ def main(args):
             else:
                 optimizer.step()
 
-            # ── Update EMA (used for evaluation only, not bootstrap) ──
+──
             ema.update(gen_model)
 
             global_step += 1
