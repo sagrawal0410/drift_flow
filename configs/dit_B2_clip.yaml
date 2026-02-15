@@ -68,8 +68,8 @@ train:
   compile_mode: "default"       # "default", "reduce-overhead", or "max-autotune"
   use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
   grad_accum_steps: 1            # accumulate over 8 class micro-batches (Nc/8 classes each)
-  feat_micro_batch: 16            # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
-                                   # Lower value needed with 37 multi-scale feature maps (A.5)
+  feat_micro_batch: 64            # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
+                                   # Lower value needed with 46 multi-scale feature maps (A.5 + norm)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
   eval_gen_per_step: 500         # FID evaluation every 5k steps
@@ -87,7 +87,7 @@ train:
 
   # Drifting loss forward config
   forward_dict:
-    recon: 64                   # N_neg: generated samples per class
+    recon: 16                   # N_neg: generated samples per class
     attn_dict:
       kernel_type: "attn_new"
       sample_norm: true
@@ -114,12 +114,16 @@ train:
 
   # Class conditioning
   n_classes: 1000
-  n_class_labels: 64            # Nc: classes sampled per step
+  n_class_labels: 16            # Nc: classes sampled per step
 
-# ── Optimizer (AdamW) ──
+# ── Optimizer (Muon + AdamW) ──
+# Muon for 2D weight matrices (attention, linear, conv);
+# AdamW for 1D params (biases, norms, embeddings).
 optimizer:
-  type: "AdamW"
-  lr: 0.0002                   # 2e-4
+  type: "MuonAdamW"
+  muon_lr: 0.0015              # 1.5e-3 — Muon lr for 2D weights
+  adamw_lr: 0.0002            # 1.5e-4 — AdamW lr for biases/norms (10× lower)
   weight_decay: 0.01
-  beta1: 0.9
-  beta2: 0.95
+  momentum: 0.95               # Muon momentum (with Nesterov)
+  beta1: 0.9                   # AdamW beta1
+  beta2: 0.95                  # AdamW beta2

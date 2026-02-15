@@ -28,14 +28,21 @@ export MASTER_ADDR=$(hostname)
 export MASTER_PORT=$(( 29500 + RANDOM % 1000 ))
 echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
 
-# ── Pre-download SD-VAE (single process, avoids HF cache race condition) ──
-# The VAE decoder is needed every step (latents → pixels → MoCo v2 features)
-# and also for FID evaluation. MoCo v2 loads from local checkpoint, no download needed.
-echo "Pre-downloading SD-VAE..."
+# ── Pre-download models (single process, avoids cache race conditions) ──
+# SD-VAE: needed every step (latents → pixels → MoCo v2 features) and for FID eval
+# Inception: needed for FID evaluation (torch-fidelity downloads on first use)
+echo "Pre-downloading SD-VAE and Inception weights..."
 python -c "
 from diffusers import AutoencoderKL
 AutoencoderKL.from_pretrained('stabilityai/sd-vae-ft-ema')
 print('SD-VAE cached.')
+
+import torch
+torch.hub.load_state_dict_from_url(
+    'https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/weights-inception-2015-12-05-6726825d.pth',
+    progress=True
+)
+print('Inception weights cached.')
 "
 
 # ── Train ──
