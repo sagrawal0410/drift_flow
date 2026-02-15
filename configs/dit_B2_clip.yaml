@@ -68,7 +68,7 @@ train:
   compile_mode: "default"       # "default", "reduce-overhead", or "max-autotune"
   use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
   grad_accum_steps: 1            # accumulate over 8 class micro-batches (Nc/8 classes each)
-  feat_micro_batch: 64            # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
+  feat_micro_batch: 16            # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
                                    # Lower value needed with 37 multi-scale feature maps (A.5)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
