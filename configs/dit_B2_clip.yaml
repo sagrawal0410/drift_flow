@@ -70,7 +70,7 @@ train:
   grad_accum_steps: 1            # accumulate over 8 class micro-batches (Nc/8 classes each)
   feat_micro_batch: 64            # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
                                    # Lower value needed with 46 multi-scale feature maps (A.5 + norm)
-  eval_bsz_per_gpu: 16
+  eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
   eval_gen_per_step: 500         # FID evaluation every 5k steps
   eval_fid_samples: 50000         # 50k generated samples for FID
@@ -114,7 +114,7 @@ train:
 
   # Class conditioning
   n_classes: 1000
-  n_class_labels: 64            # Nc: classes sampled per step
+  n_class_labels: 16            # Nc: classes sampled per step
 
 # ── Optimizer (Muon + AdamW) ──
 # Muon for 2D weight matrices (attention, linear, conv);
