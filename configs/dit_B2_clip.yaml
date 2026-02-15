@@ -67,7 +67,7 @@ train:
   compile_model: true          # set true to torch.compile generator + VAE + MoCo
   compile_mode: "default"       # "default", "reduce-overhead", or "max-autotune"
   use_bf16: true                 # bfloat16 mixed precision (halves activation memory)
-  grad_accum_steps: 1            # accumulate over 8 class micro-batches (Nc/8 classes each)
+  grad_accum_steps: 4            # accumulate over 8 class micro-batches (Nc/8 classes each)
   feat_micro_batch: 64           # max samples per VAE+MoCo sub-batch (with gradient checkpointing)
   eval_bsz_per_gpu: 64
   save_per_step: 5000             # checkpoint every 5k steps
