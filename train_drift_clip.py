@@ -709,8 +709,6 @@ def main(args):
     pos_bank_size = train_cfg.get("pos_bank_size", 128)
 
     # Memory optimization config
-    # Note: grad_accum_steps is no longer used — DDP class splitting replaces it.
-    # Each GPU processes Nc // world_size classes, so no accumulation needed.
     use_bf16 = train_cfg.get("use_bf16", False)
 
     # Loss config (from config train.forward_dict.attn_dict)
@@ -795,54 +793,24 @@ def main(args):
             # very first step, selected classes already have ≥1 entry.
             mem_bank.update(latents, labels)
 
-            # ════════════════════════════════════════════════
-            # DDP class splitting: rank 0 samples Nc classes, broadcasts
-            # to all ranks, then each rank takes a disjoint shard.
-            # This reduces per-GPU work from Nc to Nc // world_size.
-            # ════════════════════════════════════════════════
-            if world_size > 1:
-                # Rank 0 picks Nc classes from this batch's unique labels
-                unique_labels = labels.unique()
-                # Pad selection buffer to fixed size Nc so broadcast works
-                selected_buf = torch.zeros(Nc, dtype=torch.long, device=device)
-                n_available = torch.tensor(0, dtype=torch.long, device=device)
-                if rank == 0:
-                    if len(unique_labels) < Nc:
-                        actual = unique_labels
-                    else:
-                        perm = torch.randperm(len(unique_labels), device=device)[:Nc]
-                        actual = unique_labels[perm]
-                    n_available.fill_(len(actual))
-                    selected_buf[:len(actual)] = actual
-                dist.broadcast(selected_buf, src=0)
-                dist.broadcast(n_available, src=0)
-                n_avail = n_available.item()
-                all_selected = selected_buf[:n_avail]
-
-                # Each rank takes its disjoint shard
-                local_Nc = math.ceil(n_avail / world_size)
-                start = rank * local_Nc
-                end = min(start + local_Nc, n_avail)
-                my_classes = all_selected[start:end]
+            # ── Group batch by class, pick up to Nc classes ──
+            unique_labels = labels.unique()
+            if len(unique_labels) < Nc:
+                selected = unique_labels
             else:
-                # Single GPU: process all Nc classes
-                unique_labels = labels.unique()
-                if len(unique_labels) < Nc:
-                    my_classes = unique_labels
-                else:
-                    perm = torch.randperm(len(unique_labels), device=device)[:Nc]
-                    my_classes = unique_labels[perm]
+                perm = torch.randperm(len(unique_labels), device=device)[:Nc]
+                selected = unique_labels[perm]
 
             optimizer.zero_grad()
             accum_loss = 0.0
             accum_info = {}
 
-            # ── Process this rank's shard of classes ──
+            # ── Process all Nc classes on each GPU (standard DDP) ──
             pos_list = []
             gen_list = []
             valid_classes = []
 
-            for c in my_classes:
+            for c in selected:
                 c_val = c.item()
 
                 # Draw N_pos positives from the memory bank
@@ -865,17 +833,10 @@ def main(args):
                 valid_classes.append(c_val)
 
             if len(valid_classes) == 0:
-                # Must still participate in DDP all-reduce with a zero-grad backward
-                # to avoid NCCL hangs (all ranks must call backward on DDP model).
-                dummy = torch.zeros(1, device=device, requires_grad=True)
-                dummy_out = (generator(torch.zeros(1, dtype=torch.long, device=device),
-                             cfg_scale=cfg_scale)["samples"] * 0.0).sum() + dummy
-                dummy_out.backward()
-                optimizer.zero_grad()
                 continue
 
-            target_batch = torch.stack(pos_list, dim=0)       # [local_valid, N_pos, 4, 32, 32]
-            gen_batch = torch.stack(gen_list, dim=0)           # [local_valid, N_neg, 4, 32, 32]
+            target_batch = torch.stack(pos_list, dim=0)       # [n_valid, N_pos, 4, 32, 32]
+            gen_batch = torch.stack(gen_list, dim=0)           # [n_valid, N_neg, 4, 32, 32]
 
             # ════════════════════════════════════════════════
             # Step C: Feature extraction + contrastive loss
@@ -884,8 +845,8 @@ def main(args):
             #   Target features extracted under no_grad (by FeatureExtractor).
             #   Generated features keep full gradient back to DitGen.
             # ════════════════════════════════════════════════
-            local_loss = torch.zeros(len(valid_classes), device=device)
-            local_info = {}
+            total_loss = torch.zeros(len(valid_classes), device=device)
+            loss_info = {}
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
                 for feat in feature_extractors:
@@ -894,25 +855,22 @@ def main(args):
                         recon=gen_batch,
                         contra_dict=contra_dict,
                     )
-                    local_loss = local_loss + loss
+                    total_loss = total_loss + loss
                     for k, v in info.items():
-                        local_info[f"{feat.name()}/{k}"] = v
+                        loss_info[f"{feat.name()}/{k}"] = v
 
-            # ── Loss: mean over this rank's classes ──
-            # DDP all-reduce averages gradients across ranks, so each rank
-            # computing mean(local_classes) and DDP averaging gives
-            # mean(all Nc classes) — mathematically exact.
-            avg_loss = local_loss.mean()
+            # ── Loss: mean over all Nc classes on this GPU ──
+            # DDP all-reduce averages gradients across ranks automatically.
+            avg_loss = total_loss.mean()
             avg_loss.backward()
 
             # Accumulate metrics for logging
             accum_loss = avg_loss.item()
-            for k, v in local_info.items():
+            for k, v in loss_info.items():
                 accum_info[k] = v.item() if isinstance(v, torch.Tensor) else v
 
             # ════════════════════════════════════════════════
             # Step D: Gradient clipping + optimizer step
-            #   DDP all-reduce averages gradients from all ranks' class shards
             # ════════════════════════════════════════════════
             grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
 

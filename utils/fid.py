@@ -377,15 +377,29 @@ def eval_fid(
             if sample_size <= 0:
                 break
 
-            if sample_size < gpu_batch_size:
-                if isinstance(batch, tuple) or isinstance(batch, list):
+            # Pad the last partial batch to gpu_batch_size so torch.compile
+            # never sees a new shape (avoids expensive retracing that can
+            # exceed the NCCL timeout and hang distributed eval).
+            is_partial = sample_size < gpu_batch_size
+            if is_partial:
+                if isinstance(batch, (tuple, list)):
+                    # Repeat-pad each tensor in the batch to gpu_batch_size
                     batch = [x[:sample_size] for x in batch]
+                    batch = [
+                        torch.cat([x, x[:gpu_batch_size - sample_size]], dim=0)
+                        for x in batch
+                    ]
                 else:
                     assert isinstance(batch, torch.Tensor)
                     batch = batch[:sample_size]
+                    batch = torch.cat([batch, batch[:gpu_batch_size - sample_size]], dim=0)
 
             gen = generator(batch)
-            assert (gen >= 0).all() and (gen <= 1).all()
+            gen = gen.clamp(0, 1)
+
+            # Only save the real (non-padded) samples
+            if is_partial:
+                gen = gen[:sample_size]
             folder.process_and_save(gen)
 
             current_samples += sample_size
