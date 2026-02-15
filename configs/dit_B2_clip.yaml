@@ -87,7 +87,7 @@ train:
 
   # Drifting loss forward config
   forward_dict:
-    recon: 16                   # N_neg: generated samples per class
+    recon: 64                   # N_neg: generated samples per class
     attn_dict:
       kernel_type: "attn_new"
       sample_norm: true
@@ -114,7 +114,7 @@ train:
 
   # Class conditioning
   n_classes: 1000
-  n_class_labels: 16            # Nc: classes sampled per step
+  n_class_labels: 64            # Nc: classes sampled per step
 
 # ── Optimizer (Muon + AdamW) ──
 # Muon for 2D weight matrices (attention, linear, conv);
