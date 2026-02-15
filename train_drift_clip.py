@@ -611,7 +611,8 @@ def main(args):
     pos_bank_size = train_cfg.get("pos_bank_size", 128)
 
     # Memory optimization config
-    grad_accum_steps = train_cfg.get("grad_accum_steps", 1)
+    # Note: grad_accum_steps is no longer used — DDP class splitting replaces it.
+    # Each GPU processes Nc // world_size classes, so no accumulation needed.
     use_bf16 = train_cfg.get("use_bf16", False)
 
     # Loss config (from config train.forward_dict.attn_dict)
@@ -654,8 +655,10 @@ def main(args):
         print(f"  Warmup steps:         {warmup_steps}")
         print(f"  Save every:           {save_every} steps")
         print(f"  Eval FID every:       {eval_every} steps ({eval_fid_samples} samples)")
+        local_Nc = math.ceil(Nc / world_size)
         print(f"  Nc={Nc}, N_pos={N_pos}, N_neg={N_neg}")
-        print(f"  Grad accum steps:     {grad_accum_steps} (micro_Nc ≈ {max(1, Nc // grad_accum_steps)})")
+        print(f"  DDP class splitting:  {Nc} classes / {world_size} GPUs = {local_Nc} classes/GPU")
+        print(f"  Samples per GPU:      {local_Nc} × {N_neg} = {local_Nc * N_neg} generated")
         print(f"  Mixed precision:      {'bf16' if use_bf16 else 'fp32'}")
         print(f"  Feat micro-batch:     {feat_mb} (VAE+MoCo sub-batch, checkpointed)")
         print(f"  CFG alpha:            {cfg_scale} (1.0 = no CFG)")
@@ -696,99 +699,125 @@ def main(args):
             # very first step, selected classes already have ≥1 entry.
             mem_bank.update(latents, labels)
 
-            # ── Group batch by class, pick up to Nc classes ──
-            unique_labels = labels.unique()
-            if len(unique_labels) < Nc:
-                selected = unique_labels
-            else:
-                perm = torch.randperm(len(unique_labels), device=device)[:Nc]
-                selected = unique_labels[perm]
+            # ════════════════════════════════════════════════
+            # DDP class splitting: rank 0 samples Nc classes, broadcasts
+            # to all ranks, then each rank takes a disjoint shard.
+            # This reduces per-GPU work from Nc to Nc // world_size.
+            # ════════════════════════════════════════════════
+            if world_size > 1:
+                # Rank 0 picks Nc classes from this batch's unique labels
+                unique_labels = labels.unique()
+                # Pad selection buffer to fixed size Nc so broadcast works
+                selected_buf = torch.zeros(Nc, dtype=torch.long, device=device)
+                n_available = torch.tensor(0, dtype=torch.long, device=device)
+                if rank == 0:
+                    if len(unique_labels) < Nc:
+                        actual = unique_labels
+                    else:
+                        perm = torch.randperm(len(unique_labels), device=device)[:Nc]
+                        actual = unique_labels[perm]
+                    n_available.fill_(len(actual))
+                    selected_buf[:len(actual)] = actual
+                dist.broadcast(selected_buf, src=0)
+                dist.broadcast(n_available, src=0)
+                n_avail = n_available.item()
+                all_selected = selected_buf[:n_avail]
 
-            # ── Split classes into micro-batches for gradient accumulation ──
-            # Each micro-batch processes a subset of classes independently.
-            # The contrastive loss is per-class, so accumulation is exact.
-            n_selected = len(selected)
-            micro_Nc = max(1, math.ceil(n_selected / grad_accum_steps))
-            class_chunks = [selected[i:i+micro_Nc]
-                            for i in range(0, n_selected, micro_Nc)]
-            n_chunks = len(class_chunks)
+                # Each rank takes its disjoint shard
+                local_Nc = math.ceil(n_avail / world_size)
+                start = rank * local_Nc
+                end = min(start + local_Nc, n_avail)
+                my_classes = all_selected[start:end]
+            else:
+                # Single GPU: process all Nc classes
+                unique_labels = labels.unique()
+                if len(unique_labels) < Nc:
+                    my_classes = unique_labels
+                else:
+                    perm = torch.randperm(len(unique_labels), device=device)[:Nc]
+                    my_classes = unique_labels[perm]
 
             optimizer.zero_grad()
             accum_loss = 0.0
             accum_info = {}
-            total_valid = 0
 
-            for chunk_idx, class_chunk in enumerate(class_chunks):
-                pos_list = []
-                gen_list = []
-                valid_classes = []
+            # ── Process this rank's shard of classes ──
+            pos_list = []
+            gen_list = []
+            valid_classes = []
 
-                for c in class_chunk:
-                    c_val = c.item()
+            for c in my_classes:
+                c_val = c.item()
 
-                    # Draw N_pos positives from the memory bank
-                    pos_samples = mem_bank.sample(c_val, N_pos)
-                    if pos_samples is None:
-                        continue  # class not yet in the bank (shouldn't happen after update)
-                    pos_list.append(pos_samples)  # [N_pos, 4, 32, 32]
+                # Draw N_pos positives from the memory bank
+                pos_samples = mem_bank.sample(c_val, N_pos)
+                if pos_samples is None:
+                    continue  # class not yet in the bank
+                pos_list.append(pos_samples)  # [N_pos, 4, 32, 32]
 
-                    # ════════════════════════════════════════════
-                    # Step B: (class + noise) -> DitGen -> generated_latents
-                    #   Class-conditioned, no CFG (alpha=1.0)
-                    #   bf16 autocast keeps activations in half-precision
-                    # ════════════════════════════════════════════
-                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
-                        class_cond = torch.full((N_neg,), c_val, dtype=torch.long, device=device)
-                        gen_output = gen_model(class_cond, cfg_scale=cfg_scale)
-                        generated_latents = gen_output["samples"]  # [N_neg, 4, 32, 32]
-                    gen_list.append(generated_latents)
-
-                    valid_classes.append(c_val)
-
-                if len(valid_classes) == 0:
-                    continue
-
-                target_batch = torch.stack(pos_list, dim=0)       # [chunk_valid, N_pos, 4, 32, 32]
-                gen_batch = torch.stack(gen_list, dim=0)           # [chunk_valid, N_neg, 4, 32, 32]
-
-                # ════════════════════════════════════════════════
-                # Step C: Feature extraction + contrastive loss
-                #   MoCoV2MultiScaleFeatures uses gradient checkpointing +
-                #   sub-batching internally for memory efficiency (A.5).
-                #   Target features extracted under no_grad (by FeatureExtractor).
-                #   Generated features keep full gradient back to DitGen.
-                # ════════════════════════════════════════════════
-                chunk_loss = torch.zeros(len(valid_classes), device=device)
-                chunk_info = {}
-
+                # ════════════════════════════════════════════
+                # Step B: (class + noise) -> DitGen -> generated_latents
+                #   Class-conditioned, no CFG (alpha=1.0)
+                #   bf16 autocast keeps activations in half-precision
+                # ════════════════════════════════════════════
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
-                    for feat in feature_extractors:
-                        loss, info = feat(
-                            target=target_batch,
-                            recon=gen_batch,
-                            contra_dict=contra_dict,
-                        )
-                        chunk_loss = chunk_loss + loss
-                        for k, v in info.items():
-                            chunk_info[f"{feat.name()}/{k}"] = v
+                    class_cond = torch.full((N_neg,), c_val, dtype=torch.long, device=device)
+                    gen_output = gen_model(class_cond, cfg_scale=cfg_scale)
+                    generated_latents = gen_output["samples"]  # [N_neg, 4, 32, 32]
+                gen_list.append(generated_latents)
 
-                # Scale loss for gradient accumulation and backward
-                avg_chunk_loss = chunk_loss.mean() / n_chunks
-                avg_chunk_loss.backward()
+                valid_classes.append(c_val)
 
-                # Accumulate metrics for logging
-                accum_loss += chunk_loss.mean().item() / n_chunks
-                for k, v in chunk_info.items():
-                    val = v.item() if isinstance(v, torch.Tensor) else v
-                    accum_info[k] = accum_info.get(k, 0) + val / n_chunks
-                total_valid += len(valid_classes)
-
-            if total_valid == 0:
+            if len(valid_classes) == 0:
+                # Must still participate in DDP all-reduce with a zero-grad backward
+                # to avoid NCCL hangs (all ranks must call backward on DDP model).
+                dummy = torch.zeros(1, device=device, requires_grad=True)
+                dummy_out = (generator(torch.zeros(1, dtype=torch.long, device=device),
+                             cfg_scale=cfg_scale)["samples"] * 0.0).sum() + dummy
+                dummy_out.backward()
+                optimizer.zero_grad()
                 continue
+
+            target_batch = torch.stack(pos_list, dim=0)       # [local_valid, N_pos, 4, 32, 32]
+            gen_batch = torch.stack(gen_list, dim=0)           # [local_valid, N_neg, 4, 32, 32]
+
+            # ════════════════════════════════════════════════
+            # Step C: Feature extraction + contrastive loss
+            #   MoCoV2MultiScaleFeatures uses gradient checkpointing +
+            #   sub-batching internally for memory efficiency (A.5).
+            #   Target features extracted under no_grad (by FeatureExtractor).
+            #   Generated features keep full gradient back to DitGen.
+            # ════════════════════════════════════════════════
+            local_loss = torch.zeros(len(valid_classes), device=device)
+            local_info = {}
+
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bf16):
+                for feat in feature_extractors:
+                    loss, info = feat(
+                        target=target_batch,
+                        recon=gen_batch,
+                        contra_dict=contra_dict,
+                    )
+                    local_loss = local_loss + loss
+                    for k, v in info.items():
+                        local_info[f"{feat.name()}/{k}"] = v
+
+            # ── Loss: mean over this rank's classes ──
+            # DDP all-reduce averages gradients across ranks, so each rank
+            # computing mean(local_classes) and DDP averaging gives
+            # mean(all Nc classes) — mathematically exact.
+            avg_loss = local_loss.mean()
+            avg_loss.backward()
+
+            # Accumulate metrics for logging
+            accum_loss = avg_loss.item()
+            for k, v in local_info.items():
+                accum_info[k] = v.item() if isinstance(v, torch.Tensor) else v
+            total_valid = len(valid_classes)
 
             # ════════════════════════════════════════════════
             # Step D: Gradient clipping + optimizer step
-            #   Gradients accumulated from all class micro-batches
+            #   DDP all-reduce averages gradients from all ranks' class shards
             # ════════════════════════════════════════════════
             grad_norm = torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
 
@@ -800,7 +829,7 @@ def main(args):
             else:
                 optimizer.step()
 
-──
+            # ── Update EMA (used for evaluation only, not bootstrap) ──
             ema.update(gen_model)
 
             global_step += 1
