@@ -9,12 +9,12 @@
 #SBATCH --cpus-per-task=80
 #SBATCH --mem=256G
 #SBATCH --time=86:00:00
-#SBATCH --output=/data/scratch-oc40/shaurya10/logs/train_clip_%j.out
-#SBATCH --error=/data/scratch-oc40/shaurya10/logs/train_clip_%j.err
+#SBATCH --output=/data/scratch/shaurya10/logs/train_clip_%j.out
+#SBATCH --error=/data/scratch/shaurya10/logs/train_clip_%j.err
 
 set -e
 
-mkdir -p /data/scratch-oc40/shaurya10/logs
+mkdir -p /data/scratch/shaurya10/logs
 
 # ── Conda activation ──
 source /data/scratch-oc40/shaurya10/miniconda3/etc/profile.d/conda.sh
