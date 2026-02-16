@@ -618,17 +618,7 @@ def main(args):
     # ── EMA model (for evaluation / FID only) ──
     ema_decay = cfg.train.get("ema_decay", 0.999)
     gen_model_raw = generator.module if world_size > 1 else generator
-        # Unwrap torch.compile OptimizedModule before deepcopy.
-    # deepcopy of a compiled model creates a broken compilation cache that
-    # causes torch.compile to retrace during FID eval, leading to NCCL
-    # timeouts at the last batch (97/98 hang).  The raw model shares the
-    # same parameter tensors, so EMA updates still work correctly.
-    gen_model_uncompiled = (
-        gen_model_raw._orig_mod
-        if hasattr(gen_model_raw, '_orig_mod')
-        else gen_model_raw
-    )
-    ema = EMA(gen_model_uncompiled, decay=ema_decay)
+    ema = EMA(gen_model_raw, decay=ema_decay)
     if is_main:
         print(f"EMA (eval only): decay={ema_decay}")
 

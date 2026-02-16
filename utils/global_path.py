@@ -1,7 +1,7 @@
 # ── Checkpoint storage ──
 # Root directory where training checkpoints are saved/loaded by ckpt_utils.py.
 # Structure: <ckpt_root>/<run_id>/checkpoints/checkpoint-<step>.pth
-ckpt_root = "/data/scratch-oc40/shaurya10/drift_flow/checkpoints/"
+ckpt_root = "/data/scratch/shaurya10/drift_flow/checkpoints/"
 
 # ── FID reference statistics ──
 # Precomputed Inception statistics (.npz) for FID computation.
@@ -34,7 +34,7 @@ imagenet_cache_root = {
 
 # Download directory for small datasets (MNIST, CIFAR-10).
 # Used by dataset.py for torchvision dataset downloads.
-dataset_download_path = "/data/scratch-oc40/shaurya10/drift_flow/data"
+dataset_download_path = "/data/scratch/shaurya10/drift_flow/data"
 
 # ── Tar-based dataset paths (optional, for SLURM local-disk caching) ──
 # Path to tarball of ImageNet images. Only used if tar_local=True.
