@@ -48,4 +48,4 @@ print('Inception weights cached.')
 # ── Train ──
 torchrun --nproc_per_node=8 train_drift_clip_small.py \
     --config configs/dit_B2_clip.yaml \
-    --cached_path /data/scratch-oc40/shaurya10/cache_latents/train \
+    --cached_path /data/scratch-oc40/shaurya10/cache_latents/train
