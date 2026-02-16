@@ -678,6 +678,7 @@ def main(args):
 
     # ── Checkpoint resume ──
     start_step = 0
+    start_epoch = 0
     load_dict = cfg.train.get("load_dict", {})
     resume_run_id = args.resume_run_id or load_dict.get("run_id", "")
     if resume_run_id:
@@ -688,8 +689,9 @@ def main(args):
         ema.model.load_state_dict(ckpt["ema"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt.get("global_step", 0)
+        start_epoch = ckpt.get("epoch", 0)
         if is_main:
-            print(f"Resumed from step {start_step}")
+            print(f"Resumed from step {start_step}, epoch {start_epoch}")
 
     # ── VAE decoder for FID evaluation (reuse the training VAE) ──
     vae = train_vae  # same frozen VAE used in the MoCo feature pipeline
@@ -779,7 +781,7 @@ def main(args):
         print(f"{'='*60}\n")
 
     gen_model = generator.module if world_size > 1 else generator
-    epoch = 0
+    epoch = start_epoch if resume_run_id else 0
 
     while global_step < total_steps:
         if world_size > 1:
