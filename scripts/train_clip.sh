@@ -9,12 +9,12 @@
 #SBATCH --cpus-per-task=80
 #SBATCH --mem=256G
 #SBATCH --time=86:00:00
-#SBATCH --output=/data/scratch/shaurya10/logs/train_clip_%j.out
-#SBATCH --error=/data/scratch/shaurya10/logs/train_clip_%j.err
+#SBATCH --output=/data/scratch/shaurya10/drift_flow/logs/train_clip_%j.out
+#SBATCH --error=/data/scratch/shaurya10/drift_flow/logs/train_clip_%j.err
 
 set -e
 
-mkdir -p /data/scratch/shaurya10/logs
+mkdir -p /data/scratch/shaurya10/drift_flow/logs
 
 # ── Conda activation ──
 source /data/scratch-oc40/shaurya10/miniconda3/etc/profile.d/conda.sh
@@ -46,6 +46,6 @@ print('Inception weights cached.')
 "
 
 # ── Train ──
-torchrun --nproc_per_node=8 train_drift_clip.py \
+torchrun --nproc_per_node=8 train_drift_clip_small.py \
     --config configs/dit_B2_clip.yaml \
     --cached_path /data/scratch-oc40/shaurya10/cache_latents/train
