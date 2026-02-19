@@ -256,21 +256,22 @@ class TemporalFolders:
         )
 
 
-def visualize_imagenet_samples(generator, logger, class_list=[207,360,388,113,355,980,323,979], samples_per_class=8, log_prefix=""):
+def visualize_imagenet_samples(generator, logger, class_list=[207,360,388,113,355,980,323,979], samples_per_class=8, log_prefix="", step=None):
     '''
     Args:
         generator: a function, takes in a batch of classes, returns a batch of samples (B, C, H, W) within range [0, 1]
         logger: a logger, to log the samples
         class_list: a list of class ids
         samples_per_class: the number of samples to generate per class
-        log_prefix: the prefix for logging
+        log_prefix: ignored (kept for compat). Images go under fixed key "viz/samples" for easy evolution tracking.
+        step: training step for wandb association (enables step slider to see quality evolution)
     '''
     if get_rank() > 0:
         return 
     with torch.inference_mode():
         id_tensor = torch.tensor([x for x in class_list for _ in range(samples_per_class)], device='cuda')
         gen_samples = generator(id_tensor)
-        logger.log_image(f"viz/{log_prefix}", gen_samples)
+        logger.log_image("viz/samples", gen_samples, step=step)
 
 def prepare_val_prec_recall():
     '''
@@ -318,6 +319,7 @@ def eval_fid(
     log_folder_name="",
     eval_clip=False, 
     eval_prc_recall=False,
+    step=None,
 ):
     """
     Generate and evaluate FID for a given generator and dataset.
@@ -409,13 +411,13 @@ def eval_fid(
     # log fid
     if distributed:
         torch.distributed.barrier()
-    # log samples
+    # log samples (fixed key so wandb shows one gallery with step slider for evolution)
     if rank == 0:
         first_samples = folder.get_first_n_images_01(64)
         for i in range(64):
             print(first_samples[i].shape)
             print(first_samples[i].mean(), first_samples[i].std())
-        logger.log_image(f"{log_folder_name}_viz/{log_prefix}", first_samples)
+        logger.log_image(f"{log_folder_name}_viz/samples", first_samples, step=step)
 
     
     print("Generating samples time:", time.time() - start_time)

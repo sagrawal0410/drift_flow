@@ -931,6 +931,7 @@ def main(args):
                     generator=ema_gen_fn,
                     logger=logger,
                     log_prefix=f"step_{global_step}",
+                    step=global_step,
                 )
 
                 # ── Evaluate EMA model FID ──
@@ -943,6 +944,7 @@ def main(args):
                     log_prefix=f"EMA_{global_step}",
                     dataset=dataset_name,
                     log_folder_name="eval",
+                    step=global_step,
                 )
                 if is_main:
                     fid_val = ema_fid_result.get("fid", float("nan"))
@@ -989,6 +991,7 @@ def main(args):
         generator=ema_gen_fn,
         logger=logger,
         log_prefix=f"final_{global_step}",
+        step=global_step,
     )
     final_fid = eval_fid(
         generator=ema_gen_fn,
@@ -999,6 +1002,7 @@ def main(args):
         log_prefix=f"EMA_final_{global_step}",
         dataset=dataset_name,
         log_folder_name="eval",
+        step=global_step,
     )
     if is_main:
         fid_val = final_fid.get("fid", float("nan"))
