@@ -1,37 +1,3 @@
-"""
-Drifting Model Training Script for ImageNet 256x256 (Latent Space)
-
-Training pipeline (per step):
-=============================
-    Images ──> SD-VAE encoder ──> target_latents (frozen, pre-cached)
-    (class + noise) ──> DitGen ──> generated_latents (has gradients)
-                                        │
-                    ┌───────────────────┘
-                    ▼
-            Feature Extractors (frozen, but NO torch.no_grad —
-            gradients flow through back to DitGen):
-              • Flatten  — global loss (whole-latent similarity)
-              • Coordinate — per-pixel loss (coordinate-wise)
-              • UnfoldFeatures (ds=1) — patch loss at 1x downsampled
-              • UnfoldFeatures (ds=2) — patch loss at 1x + 2x downsampled
-                    │
-                    ▼
-            Contrastive drifting loss (energy_loss.py)
-              (old_recon defaults to detached current recon)
-                    │
-                    ▼
-            Backprop → update DitGen only
-
-Pre-caching (one-time):
-    torchrun --nproc_per_node=NUM_GPUS dataset/cache_latent.py \
-        --data_path /path/to/imagenet --cached_path /path/to/cache --split train
-    (then again with --split val)
-
-Training (30k steps, 5k warmup):
-    torchrun --nproc_per_node=NUM_GPUS train_drift.py \
-        --config configs/dit_B2_flatten.yaml --cached_path /path/to/cache/train
-"""
-
 import os
 import argparse
 import math
@@ -53,26 +19,14 @@ from utils.logging_utils import WandbLogger
 from utils.distributed_utils import is_main_process, get_rank, get_world_size
 
 
-# (No memory bank — positives come directly from the data batch)
-
-
-# ─────────────────────────────────────────────────────────
-# Learning rate schedule with linear warmup
-# ─────────────────────────────────────────────────────────
 def get_lr(step, base_lr, warmup_steps):
-    """Linear warmup for warmup_steps, then constant base_lr."""
     if step < warmup_steps:
         return base_lr * (step + 1) / warmup_steps
     return base_lr
 
 
-# ─────────────────────────────────────────────────────────
-# Simple dataset of class labels for FID evaluation
-# ─────────────────────────────────────────────────────────
 class ClassLabelDataset(Dataset):
-    """Returns (class_label,) for each of num_classes * samples_per_class entries.
-    Used as cond_dataset for eval_fid: the generator receives class labels
-    and produces images."""
+
     def __init__(self, num_classes=1000, samples_per_class=50):
         self.labels = []
         for c in range(num_classes):
@@ -86,7 +40,6 @@ class ClassLabelDataset(Dataset):
 
 
 def build_vae_decoder(device):
-    """Load frozen SD-VAE for decoding latents -> images during FID eval."""
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
     vae.eval()
     vae.requires_grad_(False)
@@ -94,11 +47,7 @@ def build_vae_decoder(device):
 
 
 def make_eval_generator(model, vae, cfg_scale, device):
-    """Return a function compatible with eval_fid:
-        generator(batch) -> images [B, 3, 256, 256] in [0, 1]
-    where batch is a tensor of class labels from ClassLabelDataset.
-    """
-    cache_scaling = 0.18125  # same as CachedFolder
+    cache_scaling = 0.18125
 
     @torch.inference_mode()
     def generator_fn(batch):
@@ -106,25 +55,18 @@ def make_eval_generator(model, vae, cfg_scale, device):
             labels = batch[0].to(device)
         else:
             labels = batch.to(device)
-        # Generate latents with the model
         output = model(labels, cfg_scale=cfg_scale)
-        latents = output["samples"]  # [B, 4, 32, 32]
-        # Decode through SD-VAE (undo cache scaling)
+        latents = output["samples"]
         images = vae.decode(latents / cache_scaling).sample
-        images = ((images + 1) / 2).clamp(0, 1)  # [B, 3, 256, 256]
+        images = ((images + 1) / 2).clamp(0, 1)
         return images
 
     return generator_fn
 
 
-# ─────────────────────────────────────────────────────────
-# Main training loop
-# ─────────────────────────────────────────────────────────
 def main(args):
-    # ── Load config ──
     cfg = load_config(args.config)
 
-    # ── Distributed setup ──
     if 'RANK' in os.environ:
         dist.init_process_group(backend='nccl')
         local_rank = int(os.environ['LOCAL_RANK'])
@@ -139,16 +81,12 @@ def main(args):
         world_size = 1
         is_main = True
 
-    # ── Run ID ──
     dataset_name = cfg.dataset.get("name", "imagenet256_cache")
     run_name = args.run_name or cfg.wandb.get("name", None) or "dit_B2_flatten"
     run_id = get_run_name(run_name)
     if is_main:
         print(f"Run ID: {run_id}")
 
-    # ── Dataset: load cached latents ──
-    # CachedFolder reads .npz files produced by cache_latent.py
-    # Returns (latent * 0.18125, class_label) with random hflip
     cached_path = args.cached_path
     dataset = CachedFolder(root=cached_path)
     if is_main:
@@ -171,28 +109,23 @@ def main(args):
         drop_last=True,
     )
 
-    # ── Generator (from config model.decoder_config) ──
-    # DitGen accepts **kwargs and forwards to LightningDiT
-    # Deep copy decoder config to avoid any mutation issues
     import copy
     dec_cfg = copy.deepcopy(dict(cfg.model.decoder_config))
     generator = DitGen(**dec_cfg).to(device)
 
-    # Debug: verify param count consistency across ranks before DDP
     n_param_tensors = sum(1 for _ in generator.parameters())
     print(f"[Rank {rank}] generator has {n_param_tensors} parameter tensors")
 
     if world_size > 1:
-        dist.barrier()  # ensure all ranks constructed the model
+        dist.barrier()
         generator = DDP(generator, device_ids=[local_rank])
 
     if is_main:
         n_params = sum(p.numel() for p in generator.parameters()) / 1e6
         print(f"Generator parameters: {n_params:.1f}M")
 
-    # ── Wandb (initialized AFTER model + DDP to avoid config mutation) ──
     logger = WandbLogger()
-    wandb_cfg = copy.deepcopy(dict(cfg))  # deep copy so wandb can't modify original
+    wandb_cfg = copy.deepcopy(dict(cfg))
     logger.setup_wandb(
         project=cfg.wandb.get("project", "drift-flow"),
         entity=cfg.wandb.get("entity", None) or None,
@@ -200,14 +133,12 @@ def main(args):
         config=wandb_cfg,
     )
 
-    # ── EMA model (for evaluation / FID only) ──
     ema_decay = cfg.train.get("ema_decay", 0.999)
     gen_model_raw = generator.module if world_size > 1 else generator
     ema = EMA(gen_model_raw, decay=ema_decay)
     if is_main:
         print(f"EMA (eval only): decay={ema_decay}")
 
-    # ── Feature extractors (from config model.feature_params) ──
     input_shape = tuple(cfg.model.get("input_shape", [4, 32, 32]))
     feat_params = cfg.model.get("feature_params", {})
 
@@ -226,9 +157,6 @@ def main(args):
     if is_main:
         print(f"Feature extractors: {[f.name() for f in feature_extractors]}")
 
-    # ── Optimizer (from config optimizer section) ──
-    # Use add_weight_decay to exclude biases and norm layers from weight decay,
-    # matching the convention in config.py / build_model_dict.
     opt_cfg = cfg.get("optimizer", {})
     base_lr = opt_cfg.get("lr", 2e-4)
     weight_decay = opt_cfg.get("weight_decay", 0.01)
@@ -238,7 +166,6 @@ def main(args):
         betas=(opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.95)),
     )
 
-    # ── Checkpoint resume ──
     start_step = 0
     load_dict = cfg.train.get("load_dict", {})
     resume_run_id = args.resume_run_id or load_dict.get("run_id", "")
@@ -253,21 +180,18 @@ def main(args):
         if is_main:
             print(f"Resumed from step {start_step}")
 
-    # ── VAE decoder for FID evaluation (lazy-loaded on first eval) ──
-    vae = None  # loaded on demand to save memory during early training
+    vae = None
 
-    # ── Eval dataset for FID ──
     num_classes = cfg.train.get("n_classes", 1000)
     eval_dataset = ClassLabelDataset(num_classes=num_classes, samples_per_class=50)
 
-    # ── Training config (from config train section) ──
     train_cfg = cfg.train
     fwd = train_cfg.get("forward_dict", {})
     attn_cfg = fwd.get("attn_dict", {})
 
     Nc = train_cfg.get("n_class_labels", 8)
     N_neg = fwd.get("recon", 8)
-    cfg_scale = train_cfg.get("min_cfg_scale", 1.0)  # alpha=1.0 means no CFG
+    cfg_scale = train_cfg.get("min_cfg_scale", 1.0)
     warmup_steps = train_cfg.lr_schedule.get("warmup_steps", 5000)
     total_steps = train_cfg.get("n_steps", 30000)
     clip_grad = train_cfg.lr_schedule.get("clip_grad", 2.0)
@@ -276,7 +200,6 @@ def main(args):
     eval_fid_samples = train_cfg.get("eval_fid_samples", 50000)
     eval_batch_size = train_cfg.get("eval_bsz_per_gpu", 64)
 
-    # Loss config (from config train.forward_dict.attn_dict)
     contra_dict = dict(
         kernel_type=attn_cfg.get("kernel_type", "attn_new"),
         sample_norm=attn_cfg.get("sample_norm", True),
@@ -284,7 +207,6 @@ def main(args):
         R_list=attn_cfg.get("R_list", [0.02, 0.05, 0.2]),
     )
 
-    # ── Training loop (step-based, not epoch-based) ──
     global_step = start_step
     n_dataset = len(dataset)
     steps_per_epoch = n_dataset // (batch_size * world_size)
@@ -322,20 +244,13 @@ def main(args):
             if global_step >= total_steps:
                 break
 
-            # ── Learning rate warmup ──
             lr = get_lr(global_step, base_lr, warmup_steps)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
 
-            # ════════════════════════════════════════════════
-            # Step A: Images -> SD-VAE encoder -> target_latents
-            #   (pre-cached; CachedFolder returns latent * 0.18125)
-            # ════════════════════════════════════════════════
-            latents = latents.to(device, non_blocking=True)  # [B, 4, 32, 32]
-            labels = labels.to(device, non_blocking=True)    # [B]
+            latents = latents.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-            # ── Group batch by class, pick up to Nc classes ──
-            # No memory bank: positives come directly from the data batch.
             unique_labels = labels.unique()
             if len(unique_labels) < Nc:
                 selected = unique_labels
@@ -354,17 +269,12 @@ def main(args):
                 if target_latents.shape[0] == 0:
                     continue
 
-                # Pick 1 random positive per class (no memory bank)
                 rand_idx = torch.randint(0, target_latents.shape[0], (1,), device=device)
-                pos_list.append(target_latents[rand_idx])  # [1, 4, 32, 32]
+                pos_list.append(target_latents[rand_idx])
 
-                # ════════════════════════════════════════════
-                # Step B: (class + noise) -> DitGen -> generated_latents
-                #   Class-conditioned, no CFG (alpha=1.0)
-                # ════════════════════════════════════════════
                 class_cond = torch.full((N_neg,), c_val, dtype=torch.long, device=device)
                 gen_output = gen_model(class_cond, cfg_scale=cfg_scale)
-                generated_latents = gen_output["samples"]  # [N_neg, 4, 32, 32]
+                generated_latents = gen_output["samples"]
                 gen_list.append(generated_latents)
 
                 valid_classes.append(c_val)
@@ -372,31 +282,17 @@ def main(args):
             if len(valid_classes) == 0:
                 continue
 
-            target_batch = torch.stack(pos_list, dim=0)       # [B_valid, 1, 4, 32, 32]
-            gen_batch = torch.stack(gen_list, dim=0)           # [B_valid, N_neg, 4, 32, 32]
+            target_batch = torch.stack(pos_list, dim=0)
+            gen_batch = torch.stack(gen_list, dim=0)
 
-            # ════════════════════════════════════════════════
-            # Step C: Feature extraction + contrastive loss
-            #   Feature extractors are frozen (no learnable params)
-            #   but NOT wrapped in no_grad — gradients flow through
-            #   the feature transform back to the generator.
-            #
-            #   FeatureExtractor.forward internally:
-            #     - target features extracted under torch.no_grad()
-            #     - recon (generated) features keep full gradient
-            #     - old_recon=None → defaults to recon.detach()
-            #       (current generated samples, detached)
-            #     - calls group_contra_loss from energy_loss.py
-            # ════════════════════════════════════════════════
             total_loss = torch.zeros(len(valid_classes), device=device)
             all_info = {}
 
             for feat in feature_extractors:
                 loss, info = feat(
-                    target=target_batch,         # positive: real latents (no grad)
-                    recon=gen_batch,              # generated: DitGen output (has grad)
+                    target=target_batch,
+                    recon=gen_batch,
                     contra_dict=contra_dict,
-                    # old_recon omitted → defaults to recon.detach()
                 )
                 total_loss = total_loss + loss
                 for k, v in info.items():
@@ -404,20 +300,15 @@ def main(args):
 
             avg_loss = total_loss.mean()
 
-            # ════════════════════════════════════════════════
-            # Step D: Backprop -> update DitGen only
-            # ════════════════════════════════════════════════
             optimizer.zero_grad()
             avg_loss.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=clip_grad)
             optimizer.step()
 
-            # ── Update EMA (used for evaluation only, not bootstrap) ──
             ema.update(gen_model)
 
             global_step += 1
 
-            # ── Logging ──
             log_payload = {
                 "train/loss": avg_loss.item(),
                 "train/lr": optimizer.param_groups[0]['lr'],
@@ -437,7 +328,6 @@ def main(args):
                            f"loss={avg_loss.item():.6f} lr={cur_lr:.2e}")
                 print(log_str)
 
-            # ── Checkpoint saving ──
             if global_step % save_every == 0:
                 ckpt_dict = {
                     "generator": gen_model.state_dict(),
@@ -450,19 +340,16 @@ def main(args):
                 if is_main:
                     print(f"Saved checkpoint at step {global_step}")
 
-            # ── FID evaluation + sample visualization ──
             if global_step % eval_every == 0:
                 if is_main:
                     print(f"\n{'─'*40}")
                     print(f"FID evaluation at step {global_step}...")
 
-                # Lazy-load VAE on first eval
                 if vae is None:
                     vae = build_vae_decoder(device)
                     if is_main:
                         print("Loaded SD-VAE decoder for FID evaluation")
 
-                # ── Sample visualization (EMA model) ──
                 ema_gen_fn = make_eval_generator(ema.model, vae, cfg_scale, device)
                 visualize_imagenet_samples(
                     generator=ema_gen_fn,
@@ -470,7 +357,6 @@ def main(args):
                     log_prefix=f"step_{global_step}",
                 )
 
-                # ── Evaluate EMA model FID ──
                 ema_fid_result = eval_fid(
                     generator=ema_gen_fn,
                     cond_dataset=eval_dataset,
@@ -486,7 +372,6 @@ def main(args):
                     isc_val = ema_fid_result.get("isc_mean", float("nan"))
                     prec_val = ema_fid_result.get("precision", 0)
                     recall_val = ema_fid_result.get("recall", 0)
-                    # Log summary metrics to wandb for easy tracking
                     logger.log_dict({
                         "eval/ema_fid": fid_val,
                         "eval/ema_isc": isc_val,
@@ -497,7 +382,6 @@ def main(args):
                           f"IS: {isc_val:.2f}  P: {prec_val:.3f}  R: {recall_val:.3f}")
                     print(f"{'─'*40}\n")
 
-                # Sync all processes after eval
                 if world_size > 1:
                     dist.barrier()
 
@@ -505,7 +389,6 @@ def main(args):
             print(f"Epoch {epoch} complete, global_step={global_step}/{total_steps}")
         epoch += 1
 
-    # ── Final checkpoint ──
     if global_step > 0:
         ckpt_dict = {
             "generator": gen_model.state_dict(),
@@ -518,7 +401,6 @@ def main(args):
         if is_main:
             print(f"Saved final checkpoint at step {global_step}")
 
-    # ── Final FID evaluation ──
     if is_main:
         print(f"\nFinal FID evaluation at step {global_step}...")
     if vae is None:
@@ -554,11 +436,9 @@ def main(args):
 def get_args():
     parser = argparse.ArgumentParser("Drifting Model Training")
 
-    # Config (all hyperparams live in the YAML config)
     parser.add_argument('--config', type=str, default='configs/dit_B2_flatten.yaml',
                         help='Path to YAML config file')
 
-    # Deployment-specific (override or not in config)
     parser.add_argument('--cached_path', type=str, required=True,
                         help='Path to cached SD-VAE latents (output of cache_latent.py)')
     parser.add_argument('--batch_size', type=int, default=0,
