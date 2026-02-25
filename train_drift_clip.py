@@ -1,39 +1,7 @@
-"""
-Drifting Model Training Script for ImageNet 256x256 (Latent Space)
-  — MoCo v2 pixel-space feature extractor variant
 
-Training pipeline (per step):
-=============================
-    Images ──> SD-VAE encoder ──> target_latents (frozen, pre-cached)
-    (class + noise) ──> DitGen ──> generated_latents (has gradients)
-                                        │
-                    ┌───────────────────┘
-                    ▼
-            SD-VAE decoder (frozen, but NO torch.no_grad on gen path —
-            gradients flow through back to DitGen):
-              latents → pixel-space images [3, 256, 256]
-                    │
-                    ▼
-            MoCo v2 ResNet-50 backbone (frozen, but NO torch.no_grad
-            on gen path — gradients flow through back to DitGen):
-              images → 2048-d feature vectors
-                    │
-                    ▼
-            Contrastive drifting loss (energy_loss.py)
-              (old_recon defaults to detached current recon)
-                    │
-                    ▼
-            Backprop → update DitGen only
+#Drifting Model Training Script for ImageNet 256x256 (Latent Space)
+#  — MoCo v2 pixel-space feature extractor variant
 
-Pre-caching (one-time):
-    torchrun --nproc_per_node=NUM_GPUS dataset/cache_latent.py \\
-        --data_path /path/to/imagenet --cached_path /path/to/cache --split train
-    (then again with --split val)
-
-Training (30k steps, 5k warmup):
-    torchrun --nproc_per_node=NUM_GPUS train_drift_clip.py \\
-        --config configs/dit_B2_clip.yaml --cached_path /path/to/cache/train
-"""
 
 import os
 import argparse
@@ -59,16 +27,6 @@ from utils.misc import add_weight_decay
 # ─────────────────────────────────────────────────────────
 
 class CombinedMuonAdamW:
-    """Wrapper that applies Muon to exactly-2D params and AdamW to the rest.
-
-    Muon (Newton-Schulz orthogonalization) is designed for 2D weight
-    matrices in hidden layers.  3D+ tensors (embeddings, learned pos
-    encodings), biases, layer norms, and other non-2D params are
-    handled by AdamW.
-
-    The wrapper exposes the same interface as a single optimizer so
-    the training loop doesn't need to change.
-    """
 
     def __init__(self, model, muon_lr=1.5e-3, adamw_lr=1.5e-4,
                  weight_decay=0.01, momentum=0.95, betas=(0.9, 0.95)):
@@ -149,15 +107,6 @@ from utils.distributed_utils import is_main_process, get_rank, get_world_size
 # ─────────────────────────────────────────────────────────
 
 def build_moco_v2_backbone(checkpoint_path="", device="cpu"):
-    """Load a ResNet-50 backbone with MoCo v2 pretrained weights.
-
-    If checkpoint_path is provided, loads the official MoCo v2 checkpoint
-    (keys prefixed with 'module.encoder_q.'). Otherwise falls back to
-    ImageNet-supervised ResNet-50 weights from torchvision.
-
-    Returns a ResNet-50 with the final FC layer replaced by Identity,
-    outputting 2048-d features after global average pooling.
-    """
     if checkpoint_path and os.path.isfile(checkpoint_path):
         backbone = tv_models.resnet50(weights=None)
         ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -184,37 +133,7 @@ def build_moco_v2_backbone(checkpoint_path="", device="cpu"):
 
 
 class MoCoV2MultiScaleFeatures(FeatureExtractor):
-    """Multi-scale feature extractor following Section A.5 of the drifting paper.
 
-    Pipeline: latents → VAE decode → pixel images → MoCo v2 ResNet-50
-
-    Extracts feature maps at every 2 residual blocks + final layer in each
-    stage of the ResNet-50, plus the VAE decoder output (encoder input).
-
-    For each feature map [B, C, H, W], produces (per A.5):
-      (a) H×W per-location vectors (each C-dim)
-      (b) 1 global mean + 1 global std (each C-dim)
-      (c) (H/2)×(W/2) means + stds from 2×2 patches (each C-dim)
-      (d) (H/4)×(W/4) means + stds from 4×4 patches (each C-dim)
-      (e) Channel-norm: RMS of activations per channel → [B, 1, C]
-          (breaks MoCo's scale-invariance so the loss can see brightness/contrast)
-
-    For the encoder input (pixel images), computes mean(x²) per channel.
-
-    Each feature type at each extraction point gets its own independent
-    drifting loss (computed by FeatureExtractor.forward → group_contra_loss).
-
-    ResNet-50 (bottleneck, [3,4,6,3]) extraction points:
-      layer1: after block 1, block 2 (final)     → 64×64×256   (2 maps)
-      layer2: after block 1, block 3 (final)     → 32×32×512   (2 maps)
-      layer3: after block 1, 3, block 5 (final)  → 16×16×1024  (3 maps)
-      layer4: after block 1, block 2 (final)     → 8×8×2048    (2 maps)
-      Total: 9 feature maps × 5 types + 1 input  = 46 loss terms
-
-    Memory optimizations (same as before):
-      - Sub-batches VAE+MoCo forward into chunks of `micro_batch`
-      - Gradient checkpointing: recompute during backward
-    """
 
     # (layer_name, extract_after_block_indices)
     # "every 2 residual blocks + final" per stage of ResNet-50 [3,4,6,3]
